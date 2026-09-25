@@ -374,8 +374,8 @@ async function sendOtpSms(phone, code) {
     }
   }
 
-  // Aucune clé configurée → log en développement
-  console.warn(`[DEV] Code OTP pour ${phone} : ${code}`);
+  // Toujours logger le code (utile tant que les SMS ne sont pas fiables)
+  console.log(`[OTP] Code pour ${phone} : ${code}`);
 }
 
 // ============================================================================
@@ -468,6 +468,9 @@ function paginatedResponse(rows, mapper, page, limit, total) {
 
 const app = express();
 
+// Obligatoire derrière le proxy Render (corrige ERR_ERL_UNEXPECTED_X_FORWARDED_FOR)
+app.set('trust proxy', 1);
+
 // En-têtes de sécurité HTTP standards (CSP, X-Frame-Options, etc.)
 app.use(helmet());
 
@@ -543,7 +546,16 @@ router.post(
     await storeOtp(phone, code);
     await sendOtpSms(phone, code);
 
-    res.status(201).json({ userId: id, message: 'Code de vérification envoyé par SMS.' });
+    // En mode debug (ou si SMS non fiable), on renvoie aussi le code pour tester
+    const payload = {
+      userId: id,
+      message: 'Code de vérification envoyé par SMS.',
+    };
+    if (process.env.OTP_DEBUG === 'true' || process.env.NODE_ENV !== 'production') {
+      payload.debugOtp = code;
+    }
+
+    res.status(201).json(payload);
   }),
 );
 
