@@ -321,6 +321,9 @@ async function verifyAndConsumeOtp(phone, code) {
 }
 
 async function sendOtpSms(phone, code) {
+  // Toujours logger le code en premier (indispensable tant que les SMS ne sont pas fiables)
+  console.log(`[OTP] Code pour ${phone} : ${code}`);
+
   // Priorité 1 : Vonage (Nexmo)
   const vonageKey = process.env.VONAGE_API_KEY;
   const vonageSecret = process.env.VONAGE_API_SECRET;
@@ -374,8 +377,7 @@ async function sendOtpSms(phone, code) {
     }
   }
 
-  // Toujours logger le code (utile tant que les SMS ne sont pas fiables)
-  console.log(`[OTP] Code pour ${phone} : ${code}`);
+  console.warn(`[DEV] Aucun fournisseur SMS configuré — code OTP pour ${phone} : ${code}`);
 }
 
 // ============================================================================
