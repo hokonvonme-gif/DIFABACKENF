@@ -60,15 +60,29 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
 // enregistrées en base (in-app) mais aucun push n'est envoyé.
 let firebaseMessaging = null;
 if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-  const admin = require('firebase-admin');
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    }),
-  });
-  firebaseMessaging = admin.messaging();
+  try {
+    const admin = require('firebase-admin');
+    // Render stocke souvent les \n en texte : on les reconvertit en vrais sauts de ligne
+    let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+    if (privateKey.startsWith('"') && privateKey.endsWith('"')) {
+      privateKey = privateKey.slice(1, -1);
+    }
+    privateKey = privateKey.replace(/\\n/g, '\n');
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey,
+      }),
+    });
+    firebaseMessaging = admin.messaging();
+    console.log('[Firebase] Admin initialisé — push activé.');
+  } catch (err) {
+    console.error('[Firebase] Init échouée :', err.message);
+    firebaseMessaging = null;
+  }
+} else {
+  console.log('[Firebase] Variables manquantes — notifications in-app seulement.');
 }
 
 // Redis est optionnel : si REDIS_URL n'est pas fourni, on retombe sur une
