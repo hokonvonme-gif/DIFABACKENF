@@ -1493,8 +1493,38 @@ router.get(
 // MODULE 7 — INTELLIGENCE ARTIFICIELLE (Gemini, appelé directement en REST)
 // ============================================================================
 
-const GEMINI_SYSTEM_PROMPT = `Tu es l'assistant agricole de Difa, une plateforme togolaise qui connecte
+const LANG_NAMES = {
+  fr: 'français',
+  en: 'English',
+  ee: 'Eʋegbe (Ewe)',
+  ha: 'Hausa',
+  es: 'español',
+  pt: 'português',
+  ar: 'العربية (Arabic)',
+  zh: '中文 (Chinese)',
+  yo: 'Yorùbá',
+  kbp: 'Kabɩyɛ (Kabiyè)',
+};
+
+function buildGeminiSystemPrompt(langCode) {
+  const code = (langCode || 'fr').split('-')[0].toLowerCase();
+  const langName = LANG_NAMES[code] || LANG_NAMES.fr;
+
+  return `Tu es l'assistant agricole de Difa, une plateforme togolaise qui connecte
 agriculteurs, agronomes, acheteurs et transporteurs.
+
+RÈGLE OBLIGATOIRE SUR LA LANGUE :
+- Tu dois répondre UNIQUEMENT en ${langName} (code langue : ${code}).
+- Même si l'utilisateur écrit dans une autre langue, réponds en ${langName}.
+- N'utilise aucune autre langue dans ta réponse.
+
+RÈGLE OBLIGATOIRE SUR LE FORMAT :
+- Texte brut uniquement : PAS de markdown, PAS d'astérisques **, PAS de #, PAS de listes à puces markdown.
+- Pas de gras, pas d'italique, pas de backticks.
+- Utilise des phrases claires et des tirets simples "-" si tu listes des points.
+- Pas de titres markdown.
+
+Contenu :
 Tu réponds UNIQUEMENT aux questions liées à l'agriculture tropicale et
 togolaise : cultures locales (maïs, manioc, igname, tomate, riz, coton...),
 calendrier agricole, irrigation, engrais, maladies des plantes, techniques
@@ -1503,6 +1533,28 @@ Sois concis, pratique, et adapté aux réalités des petits producteurs
 togolais (accès limité à l'irrigation moderne, saisons sèche/pluvieuse).
 Si la question dépasse ton champ de compétence, invite poliment
 l'agriculteur à contacter un agronome Difa via l'application.`;
+}
+
+/** Nettoie le markdown et caractères indésirables des réponses Gemini */
+function cleanGeminiResponse(input) {
+  if (!input || typeof input !== 'string') return input || '';
+  let s = input;
+  s = s.replace(/\*\*\*(.*?)\*\*\*/gs, '$1');
+  s = s.replace(/\*\*(.*?)\*\*/gs, '$1');
+  s = s.replace(/__(.*?)__/gs, '$1');
+  s = s.replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, '$1');
+  s = s.replace(/`{1,3}([^`]*)`{1,3}/g, '$1');
+  s = s.replace(/^#{1,6}\s+/gm, '');
+  s = s.replace(/^\s*[\*\+]\s+/gm, '- ');
+  s = s.replace(/\*\*/g, '');
+  s = s.replace(/(?<!\w)\*(?!\w)/g, '');
+  s = s.replace(/_{2,}/g, '');
+  s = s.replace(/^-{3,}$/gm, '');
+  s = s.replace(/^_{3,}$/gm, '');
+  s = s.replace(/[ \t]{2,}/g, ' ');
+  s = s.replace(/\n{3,}/g, '\n\n');
+  return s.trim();
+}
 
 // Historique de conversation en mémoire par session (simple — à déplacer
 // vers Redis si tu fais tourner plusieurs instances du serveur)
@@ -1582,24 +1634,48 @@ router.post(
     const { message, sessionId } = req.body;
     if (!message) return res.status(400).json({ message: 'Message requis.' });
 
+    // Langue de l'utilisateur (préférée en base, sinon fr)
+    let lang = 'fr';
+    try {
+      const u = await pool.query('SELECT preferred_language FROM users WHERE id = $1', [
+        req.user.id,
+      ]);
+      if (u.rows[0]?.preferred_language) lang = u.rows[0].preferred_language;
+    } catch (_) {}
+
     const sid = sessionId || req.user.id;
-    const history = chatHistories.get(sid) || [];
+    // Historique par session + langue (évite de mélanger FR/EN dans le même contexte)
+    const historyKey = `${sid}:${lang}`;
+    const history = chatHistories.get(historyKey) || [];
+
+    const systemPrompt = buildGeminiSystemPrompt(lang);
 
     const contents = [
-      { role: 'user', parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
-      { role: 'model', parts: [{ text: 'Compris, je suis prêt à aider.' }] },
+      { role: 'user', parts: [{ text: systemPrompt }] },
+      {
+        role: 'model',
+        parts: [
+          {
+            text:
+              lang === 'en'
+                ? 'Understood. I will reply only in English, in plain text without markdown.'
+                : 'Compris. Je répondrai uniquement dans la langue demandée, en texte simple sans markdown.',
+          },
+        ],
+      },
       ...history,
       { role: 'user', parts: [{ text: message }] },
     ];
 
     try {
-      const replyText = await callGeminiWithRotation(contents);
+      let replyText = await callGeminiWithRotation(contents);
+      replyText = cleanGeminiResponse(replyText);
 
       history.push({ role: 'user', parts: [{ text: message }] });
       history.push({ role: 'model', parts: [{ text: replyText }] });
-      chatHistories.set(sid, history.slice(-20));
+      chatHistories.set(historyKey, history.slice(-20));
 
-      res.json({ reply: replyText, sessionId: sid });
+      res.json({ reply: replyText, sessionId: sid, language: lang });
     } catch (err) {
       console.error('[Gemini] toutes les clés ont échoué :', err.cause?.response?.data || err.message);
       res.status(502).json({
