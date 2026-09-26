@@ -299,24 +299,31 @@ function generateOtpCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+/** Normalise le numéro pour éviter les mismatch +233 / 233 / espaces */
+function normalizePhone(phone) {
+  return String(phone || '').replace(/\s+/g, '').replace(/^\+/, '');
+}
+
 async function storeOtp(phone, code) {
+  const key = normalizePhone(phone);
   if (redisClient) {
-    await redisClient.set(`otp:${phone}`, code, 'EX', OTP_TTL_SECONDS);
+    await redisClient.set(`otp:${key}`, code, 'EX', OTP_TTL_SECONDS);
   } else {
-    memoryOtpStore.set(phone, { code, expiresAt: Date.now() + OTP_TTL_SECONDS * 1000 });
+    memoryOtpStore.set(key, { code, expiresAt: Date.now() + OTP_TTL_SECONDS * 1000 });
   }
 }
 
 async function verifyAndConsumeOtp(phone, code) {
+  const key = normalizePhone(phone);
   if (redisClient) {
-    const stored = await redisClient.get(`otp:${phone}`);
-    if (!stored || stored !== code) return false;
-    await redisClient.del(`otp:${phone}`);
+    const stored = await redisClient.get(`otp:${key}`);
+    if (!stored || stored !== String(code).trim()) return false;
+    await redisClient.del(`otp:${key}`);
     return true;
   }
-  const entry = memoryOtpStore.get(phone);
-  if (!entry || entry.expiresAt < Date.now() || entry.code !== code) return false;
-  memoryOtpStore.delete(phone);
+  const entry = memoryOtpStore.get(key);
+  if (!entry || entry.expiresAt < Date.now() || entry.code !== String(code).trim()) return false;
+  memoryOtpStore.delete(key);
   return true;
 }
 
