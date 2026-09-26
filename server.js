@@ -288,6 +288,11 @@ async function initDatabase() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+  // Colonne langue préférée (notifications traduites)
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS preferred_language TEXT DEFAULT 'fr'
+  `);
   console.log('[DB] Tables prêtes.');
 }
 
@@ -766,6 +771,7 @@ function serializeUser(row) {
     region: row.region,
     phoneVerified: row.phone_verified,
     isActive: row.is_active,
+    preferredLanguage: row.preferred_language || 'fr',
     createdAt: row.created_at,
   };
 }
@@ -785,15 +791,17 @@ router.patch(
   requireAuth,
   asyncHandler(async (req, res) => {
     // Un utilisateur ne peut modifier que ses infos non sensibles
-    const { fullName, email, region } = req.body;
+    const { fullName, email, region, preferredLanguage } = req.body;
+    const lang = preferredLanguage && String(preferredLanguage).slice(0, 8);
     await pool.query(
       `UPDATE users SET
          full_name = COALESCE($1, full_name),
          email = COALESCE($2, email),
          region = COALESCE($3, region),
+         preferred_language = COALESCE($4, preferred_language),
          updated_at = now()
-       WHERE id = $4`,
-      [fullName, email, region, req.user.id],
+       WHERE id = $5`,
+      [fullName || null, email || null, region || null, lang || null, req.user.id],
     );
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
     res.json(serializeUser(result.rows[0]));
@@ -887,6 +895,7 @@ router.post(
       ],
     );
     const result = await pool.query('SELECT * FROM cultures WHERE id = $1', [id]);
+    await notifyUser(req.user.id, 'culture_ajoutee', { name: typeCulture }, { cultureId: id });
     res.status(201).json(serializeCulture(result.rows[0]));
   }),
 );
@@ -1012,7 +1021,8 @@ router.get(
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '20', 10)));
     const offset = (page - 1) * limit;
 
-    const conditions = [`statut = 'Publié'`];
+    // Visible dès la publication (validation admin optionnelle ensuite via badge / modération)
+    const conditions = [`statut IN ('Publié', 'En attente de validation')`];
     const values = [];
 
     if (q) {
@@ -1124,6 +1134,20 @@ router.post(
       `INSERT INTO certifications (id, product_id, statut) VALUES ($1,$2,'En attente')`,
       [crypto.randomUUID(), id],
     );
+
+    await notifyUser(req.user.id, 'produit_soumis', { name: nom }, { productId: id });
+
+    // Prévenir les agronomes qu'une certification est en attente
+    try {
+      const agronomes = await pool.query(
+        `SELECT id FROM users WHERE role = 'agronome' AND is_active = true LIMIT 50`,
+      );
+      for (const a of agronomes.rows) {
+        await notifyUser(a.id, 'certification_en_attente', { name: nom }, { productId: id });
+      }
+    } catch (err) {
+      console.error('[Notif] agronomes :', err.message);
+    }
 
     const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
     res.status(201).json(serializeProduct(result.rows[0]));
@@ -1276,8 +1300,7 @@ router.post(
       await notifyUser(
         product.rows[0].agriculteur_id,
         'produit_valide',
-        'Produit certifié',
-        `Votre produit "${product.rows[0].nom}" a été validé avec le badge ${badge}.`,
+        { name: product.rows[0].nom, badge },
         { productId: existing.rows[0].product_id, badge },
       );
     }
@@ -1317,8 +1340,10 @@ router.post(
       await notifyUser(
         product.rows[0].agriculteur_id,
         'produit_rejete',
-        'Produit rejeté',
-        `Votre produit "${product.rows[0].nom}" a été rejeté.${commentaire ? ' Motif : ' + commentaire : ''}`,
+        {
+          name: product.rows[0].nom,
+          reason: commentaire ? ` Motif : ${commentaire}` : '',
+        },
         { productId: existing.rows[0].product_id },
       );
     }
@@ -1417,8 +1442,7 @@ router.post(
     await notifyUser(
       existing.rows[0].acheteur_id,
       'transporteur_en_route',
-      'Transporteur trouvé',
-      'Un transporteur a accepté votre commande et va la récupérer.',
+      {},
       { missionId: req.params.id },
     );
 
@@ -1667,8 +1691,7 @@ router.post(
         await notifyUser(
           tx.rows[0].user_id,
           'paiement_recu',
-          'Paiement confirmé',
-          `Votre paiement de ${tx.rows[0].montant_fcfa} FCFA a été reçu avec succès.`,
+          { amount: tx.rows[0].montant_fcfa },
           { reference: event.data.reference },
         );
       }
@@ -1711,14 +1734,166 @@ router.get(
 // MODULE 10 — NOTIFICATIONS
 // ============================================================================
 
-async function notifyUser(userId, type, titre, message, data) {
+/** Textes de notifications multilingues (type -> langue -> { title, body }) */
+const NOTIF_I18N = {
+  produit_soumis: {
+    fr: { title: 'Produit soumis', body: 'Votre produit "{name}" est en attente de validation.' },
+    en: { title: 'Product submitted', body: 'Your product "{name}" is pending validation.' },
+    ee: { title: 'Nusiwo ɖe ɖa', body: 'Wò nusi "{name}" le kpɔɖeŋu dzi.' },
+    ha: { title: 'An gabatar da kaya', body: 'Kayanka "{name}" yana jiran tabbatarwa.' },
+    es: { title: 'Producto enviado', body: 'Su producto "{name}" está pendiente de validación.' },
+    pt: { title: 'Produto enviado', body: 'O seu produto "{name}" está pendente de validação.' },
+    ar: { title: 'تم إرسال المنتج', body: 'منتجك "{name}" في انتظار التحقق.' },
+    zh: { title: '产品已提交', body: '您的产品“{name}”正在等待审核。' },
+    yo: { title: 'Ọja ti firanṣẹ', body: 'Ọja rẹ "{name}" ń dúró fún ìjẹ́rìísí.' },
+    kbp: { title: 'Produit soumis', body: 'Wà produit "{name}" le kpɔɖeŋu dzi.' },
+  },
+  produit_valide: {
+    fr: { title: 'Produit certifié', body: 'Votre produit "{name}" a été validé avec le badge {badge}.' },
+    en: { title: 'Product certified', body: 'Your product "{name}" was validated with badge {badge}.' },
+    ee: { title: 'Nusiwo kpe ɖe eŋu', body: 'Wò nusi "{name}" kpe ɖe eŋu kple badge {badge}.' },
+    ha: { title: 'An tabbatar da kaya', body: 'An tabbatar da kayanka "{name}" da alamar {badge}.' },
+    es: { title: 'Producto certificado', body: 'Su producto "{name}" fue validado con la insignia {badge}.' },
+    pt: { title: 'Produto certificado', body: 'O seu produto "{name}" foi validado com o selo {badge}.' },
+    ar: { title: 'منتج معتمد', body: 'تم التحقق من منتجك "{name}" بشارة {badge}.' },
+    zh: { title: '产品已认证', body: '您的产品“{name}”已通过认证，徽章：{badge}。' },
+    yo: { title: 'Ọja ti jẹ́rìísí', body: 'Ọja rẹ "{name}" ti jẹ́rìísí pẹ̀lú àmì {badge}.' },
+    kbp: { title: 'Produit certifié', body: 'Wà produit "{name}" kpe ɖe eŋu kple badge {badge}.' },
+  },
+  produit_rejete: {
+    fr: { title: 'Produit rejeté', body: 'Votre produit "{name}" a été rejeté.{reason}' },
+    en: { title: 'Product rejected', body: 'Your product "{name}" was rejected.{reason}' },
+    ee: { title: 'Wogbe nusiwo', body: 'Wogbe wò nusi "{name}".{reason}' },
+    ha: { title: 'An ƙi kaya', body: 'An ƙi kayanka "{name}".{reason}' },
+    es: { title: 'Producto rechazado', body: 'Su producto "{name}" fue rechazado.{reason}' },
+    pt: { title: 'Produto rejeitado', body: 'O seu produto "{name}" foi rejeitado.{reason}' },
+    ar: { title: 'تم رفض المنتج', body: 'تم رفض منتجك "{name}".{reason}' },
+    zh: { title: '产品已拒绝', body: '您的产品“{name}”已被拒绝。{reason}' },
+    yo: { title: 'A kọ ọja', body: 'A kọ ọja rẹ "{name}".{reason}' },
+    kbp: { title: 'Produit rejeté', body: 'Wogbe wà produit "{name}".{reason}' },
+  },
+  produit_publie: {
+    fr: { title: 'Produit publié', body: 'Votre produit "{name}" est maintenant visible sur le marché.' },
+    en: { title: 'Product published', body: 'Your product "{name}" is now visible on the market.' },
+    ee: { title: 'Nusiwo ɖe go', body: 'Wò nusi "{name}" le market dzi fifia.' },
+    ha: { title: 'An buga kaya', body: 'Yanzu ana iya ganin kayanka "{name}" a kasuwa.' },
+    es: { title: 'Producto publicado', body: 'Su producto "{name}" ya es visible en el mercado.' },
+    pt: { title: 'Produto publicado', body: 'O seu produto "{name}" está visível no mercado.' },
+    ar: { title: 'تم نشر المنتج', body: 'منتجك "{name}" مرئي الآن في السوق.' },
+    zh: { title: '产品已上架', body: '您的产品“{name}”已在市场上可见。' },
+    yo: { title: 'Ọja ti tẹ̀jáde', body: 'Ọja rẹ "{name}" ti hàn ní ọjà báyìí.' },
+    kbp: { title: 'Produit publié', body: 'Wà produit "{name}" le market dzi fifia.' },
+  },
+  culture_ajoutee: {
+    fr: { title: 'Culture enregistrée', body: 'Votre culture "{name}" a bien été enregistrée.' },
+    en: { title: 'Crop saved', body: 'Your crop "{name}" has been saved.' },
+    ee: { title: 'Agble ŋlɔ', body: 'Wò agble "{name}" ŋlɔ nyuie.' },
+    ha: { title: 'An adana amfanin gona', body: 'An adana amfanin gonarka "{name}".' },
+    es: { title: 'Cultivo registrado', body: 'Su cultivo "{name}" se ha registrado correctamente.' },
+    pt: { title: 'Cultura registada', body: 'A sua cultura "{name}" foi registada.' },
+    ar: { title: 'تم تسجيل المحصول', body: 'تم تسجيل محصولك "{name}" بنجاح.' },
+    zh: { title: '作物已保存', body: '您的作物“{name}”已保存。' },
+    yo: { title: 'Iṣẹ́-ọgbìn ti fi pamọ́', body: 'Iṣẹ́-ọgbìn rẹ "{name}" ti fi pamọ́.' },
+    kbp: { title: 'Culture enregistrée', body: 'Wà culture "{name}" ŋlɔ nyuie.' },
+  },
+  transporteur_en_route: {
+    fr: { title: 'Transporteur trouvé', body: 'Un transporteur a accepté votre commande et va la récupérer.' },
+    en: { title: 'Transporter found', body: 'A transporter accepted your order and will pick it up.' },
+    ee: { title: 'Wokpɔ dɔwɔla', body: 'Dɔwɔla aɖe lɔ wò ɖoɖo eye wòayi akpɔe.' },
+    ha: { title: 'An sami mai jigilar kaya', body: 'Mai jigilar kaya ya karɓi odar ku kuma zai ɗauke ta.' },
+    es: { title: 'Transportista encontrado', body: 'Un transportista aceptó su pedido y lo recogerá.' },
+    pt: { title: 'Transportador encontrado', body: 'Um transportador aceitou a sua encomenda e vai buscá-la.' },
+    ar: { title: 'تم العثور على ناقل', body: 'قبل ناقل طلبك وسيقوم باستلامه.' },
+    zh: { title: '已找到运输商', body: '运输商已接受您的订单并将取货。' },
+    yo: { title: 'A ti rí awakọ̀', body: 'Awakọ̀ kan ti gba àṣẹ rẹ yóò sì gbé e.' },
+    kbp: { title: 'Transporteur trouvé', body: 'Transporteur lɔ wà commande.' },
+  },
+  livraison_arrivee: {
+    fr: { title: 'Livraison effectuée', body: 'Votre commande a été livrée avec succès.' },
+    en: { title: 'Delivery completed', body: 'Your order was delivered successfully.' },
+    ee: { title: 'Wotsɔ nu va', body: 'Wotsɔ wò ɖoɖo va nyuie.' },
+    ha: { title: 'An kammala isar da kaya', body: 'An isar da odar ku cikin nasara.' },
+    es: { title: 'Entrega realizada', body: 'Su pedido se entregó correctamente.' },
+    pt: { title: 'Entrega concluída', body: 'A sua encomenda foi entregue com sucesso.' },
+    ar: { title: 'تم التسليم', body: 'تم تسليم طلبك بنجاح.' },
+    zh: { title: '配送完成', body: '您的订单已成功送达。' },
+    yo: { title: 'Ìfijiṣẹ́ ti parí', body: 'A ti fi ọ̀rọ̀ rẹ ránṣẹ́ ní àṣeyọrí.' },
+    kbp: { title: 'Livraison effectuée', body: 'Wà commande ɖe va nyuie.' },
+  },
+  paiement_recu: {
+    fr: { title: 'Paiement confirmé', body: 'Votre paiement de {amount} FCFA a été reçu avec succès.' },
+    en: { title: 'Payment confirmed', body: 'Your payment of {amount} FCFA was received successfully.' },
+    ee: { title: 'Gaƒoƒo kpe ɖe eŋu', body: 'Woxɔ wò ga {amount} FCFA nyuie.' },
+    ha: { title: 'An tabbatar da biyan kuɗi', body: 'An karɓi biyan kuɗin ku na {amount} FCFA cikin nasara.' },
+    es: { title: 'Pago confirmado', body: 'Su pago de {amount} FCFA se recibió correctamente.' },
+    pt: { title: 'Pagamento confirmado', body: 'O seu pagamento de {amount} FCFA foi recebido com sucesso.' },
+    ar: { title: 'تم تأكيد الدفع', body: 'تم استلام دفعتك بمبلغ {amount} فرنك بنجاح.' },
+    zh: { title: '付款已确认', body: '已成功收到您 {amount} FCFA 的付款。' },
+    yo: { title: 'Ìsanwó ti jẹ́rìísí', body: 'A ti gba ìsanwó rẹ {amount} FCFA ní àṣeyọrí.' },
+    kbp: { title: 'Paiement confirmé', body: 'Woxɔ wà ga {amount} FCFA nyuie.' },
+  },
+  certification_en_attente: {
+    fr: { title: 'Nouvelle certification', body: 'Un produit "{name}" attend votre inspection.' },
+    en: { title: 'New certification', body: 'A product "{name}" is waiting for your inspection.' },
+    ee: { title: 'Certification yeye', body: 'Nusi "{name}" le wò kpɔɖeŋu dzi.' },
+    ha: { title: 'Sabon tabbatarwa', body: 'Kaya "{name}" yana jiran duba ku.' },
+    es: { title: 'Nueva certificación', body: 'Un producto "{name}" espera su inspección.' },
+    pt: { title: 'Nova certificação', body: 'Um produto "{name}" aguarda a sua inspeção.' },
+    ar: { title: 'شهادة جديدة', body: 'منتج "{name}" ينتظر فحصك.' },
+    zh: { title: '新认证请求', body: '产品“{name}”等待您的检查。' },
+    yo: { title: 'Ìjẹ́rìísí tuntun', body: 'Ọja "{name}" ń dúró fún àyẹ̀wò rẹ.' },
+    kbp: { title: 'Nouvelle certification', body: 'Produit "{name}" le wà kpɔɖeŋu dzi.' },
+  },
+};
+
+function fillTemplate(str, vars = {}) {
+  return String(str || '').replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? String(vars[k]) : ''));
+}
+
+function resolveNotifText(type, lang, vars = {}, fallbackTitle, fallbackMessage) {
+  const code = (lang || 'fr').split('-')[0].toLowerCase();
+  const pack = NOTIF_I18N[type];
+  const entry = (pack && (pack[code] || pack.fr)) || null;
+  if (!entry) {
+    return { title: fallbackTitle || type, body: fallbackMessage || '' };
+  }
+  return {
+    title: fillTemplate(entry.title, vars),
+    body: fillTemplate(entry.body, vars),
+  };
+}
+
+async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
+  // Compat : notifyUser(id, type, vars, data) OU ancien notifyUser(id, type, titre, message, data)
+  let vars = {};
+  let data = null;
+  let fallbackTitle = type;
+  let fallbackMessage = '';
+
+  if (varsOrTitle && typeof varsOrTitle === 'object' && !Array.isArray(varsOrTitle)) {
+    vars = varsOrTitle;
+    data = maybeMessage && typeof maybeMessage === 'object' ? maybeMessage : null;
+  } else {
+    fallbackTitle = varsOrTitle || type;
+    fallbackMessage = typeof maybeMessage === 'string' ? maybeMessage : '';
+    data = maybeData || null;
+    // Essayer d'extraire name/badge/amount depuis l'ancien message n'est pas fiable
+  }
+
+  let lang = 'fr';
+  try {
+    const u = await pool.query('SELECT preferred_language FROM users WHERE id = $1', [userId]);
+    if (u.rows[0]?.preferred_language) lang = u.rows[0].preferred_language;
+  } catch (_) {}
+
+  const { title, body } = resolveNotifText(type, lang, vars, fallbackTitle, fallbackMessage);
+
   const id = crypto.randomUUID();
   await pool.query(
     `INSERT INTO notifications (id, user_id, type, titre, message, data) VALUES ($1,$2,$3,$4,$5,$6)`,
-    [id, userId, type, titre, message, data ? JSON.stringify(data) : null],
+    [id, userId, type, title, body, data ? JSON.stringify(data) : null],
   );
 
-  // Envoi push réel — ne bloque jamais l'appelant si ça échoue (best-effort)
   if (firebaseMessaging) {
     try {
       const tokens = (
@@ -1728,10 +1903,13 @@ async function notifyUser(userId, type, titre, message, data) {
       if (tokens.length > 0) {
         await firebaseMessaging.sendEachForMulticast({
           tokens,
-          notification: { title: titre, body: message },
-          data: data
-            ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]))
-            : undefined,
+          notification: { title, body },
+          data: {
+            type: String(type),
+            ...(data
+              ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]))
+              : {}),
+          },
         });
       }
     } catch (err) {
@@ -2041,10 +2219,25 @@ router.patch(
   asyncHandler(async (req, res) => {
     const { action } = req.body; // 'approve' | 'reject'
     const statut = action === 'approve' ? 'Publié' : 'Rejeté';
+    const prod = await pool.query('SELECT agriculteur_id, nom FROM products WHERE id = $1', [
+      req.params.id,
+    ]);
     await pool.query('UPDATE products SET statut = $1, updated_at = now() WHERE id = $2', [
       statut,
       req.params.id,
     ]);
+    if (prod.rows[0]) {
+      const type = action === 'approve' ? 'produit_publie' : 'produit_rejete';
+      await notifyUser(
+        prod.rows[0].agriculteur_id,
+        type,
+        {
+          name: prod.rows[0].nom,
+          reason: action === 'reject' ? '' : '',
+        },
+        { productId: req.params.id },
+      );
+    }
     res.json({ message: `Produit ${action === 'approve' ? 'approuvé' : 'rejeté'}.` });
   }),
 );
@@ -2161,8 +2354,7 @@ io.on('connection', (socket) => {
       await notifyUser(
         result.rows[0].acheteur_id,
         'livraison_arrivee',
-        'Livraison effectuée',
-        'Votre commande a été livrée avec succès.',
+        {},
         { missionId },
       );
     }
