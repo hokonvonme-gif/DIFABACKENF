@@ -731,9 +731,16 @@ router.post(
     if (!valid) return res.status(400).json({ message: 'Code OTP invalide ou expiré.' });
 
     const passwordHash = await bcrypt.hash(newPassword, BCRYPT_COST_FACTOR);
+    // OTP validé = numéro de confiance → on marque aussi phone_verified = true
+    // (sinon l'utilisateur ne peut pas se connecter après un reset)
     const result = await pool.query(
-      'UPDATE users SET password_hash = $1 WHERE phone = $2 RETURNING id',
-      [passwordHash, phone],
+      `UPDATE users
+       SET password_hash = $1,
+           phone_verified = true,
+           updated_at = now()
+       WHERE phone = $2 OR phone = $3 OR REPLACE(phone, '+', '') = $3
+       RETURNING id`,
+      [passwordHash, phone, normalizePhone(phone)],
     );
     if (result.rows.length === 0) {
       return res.status(400).json({ message: 'Compte introuvable.' });
