@@ -93,8 +93,32 @@ const OTP_TTL_SECONDS = 5 * 60; // 5 minutes
 const ACCESS_TOKEN_EXPIRES = process.env.JWT_ACCESS_EXPIRES || '15m';
 const REFRESH_TOKEN_DAYS = 30;
 const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || 'changez_moi_en_prod';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+/** Rotation de clés Gemini (comme ESP32) — GEMINI_API_KEYS ou GEMINI_API_KEY(_2.._5) */
+function loadGeminiKeys() {
+  const keys = [];
+  if (process.env.GEMINI_API_KEYS) {
+    process.env.GEMINI_API_KEYS.split(/[,;\s]+/)
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .forEach((k) => keys.push(k));
+  }
+  for (const name of [
+    'GEMINI_API_KEY',
+    'GEMINI_API_KEY_1',
+    'GEMINI_API_KEY_2',
+    'GEMINI_API_KEY_3',
+    'GEMINI_API_KEY_4',
+    'GEMINI_API_KEY_5',
+  ]) {
+    const v = process.env[name];
+    if (v && v.trim() && !keys.includes(v.trim())) keys.push(v.trim());
+  }
+  return keys;
+}
+const GEMINI_API_KEYS = loadGeminiKeys();
+let geminiKeyIndex = 0;
 
 const USER_ROLES = [
   'agriculteur',
@@ -122,8 +146,10 @@ function validateStartupConfig() {
         'génère une vraie valeur avec `openssl rand -hex 32`.',
     );
   }
-  if (!process.env.GEMINI_API_KEY) {
-    problems.push('GEMINI_API_KEY manquante — le chatbot (Module 7) ne fonctionnera pas.');
+  if (GEMINI_API_KEYS.length === 0) {
+    problems.push('Aucune clé Gemini (GEMINI_API_KEY ou GEMINI_API_KEYS) — le chatbot ne fonctionnera pas.');
+  } else {
+    console.log(`[Config] ${GEMINI_API_KEYS.length} clé(s) Gemini chargée(s) (rotation active).`);
   }
 
   if (problems.length > 0) {
@@ -1482,14 +1508,75 @@ l'agriculteur à contacter un agronome Difa via l'application.`;
 // vers Redis si tu fais tourner plusieurs instances du serveur)
 const chatHistories = new Map();
 
+/**
+ * Appelle Gemini en tournant les clés (429 / 401 / 403 / erreur réseau → clé suivante).
+ * Même logique que le firmware ESP32 (geminiKeyIndex + continue).
+ */
+async function callGeminiWithRotation(contents) {
+  if (GEMINI_API_KEYS.length === 0) {
+    const err = new Error('NO_GEMINI_KEYS');
+    err.code = 'NO_GEMINI_KEYS';
+    throw err;
+  }
+
+  let lastError = null;
+  const attempts = GEMINI_API_KEYS.length;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const apiKey = GEMINI_API_KEYS[geminiKeyIndex];
+    geminiKeyIndex = (geminiKeyIndex + 1) % GEMINI_API_KEYS.length;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+    try {
+      const response = await axios.post(
+        url,
+        {
+          contents,
+          generationConfig: { temperature: 0.6, maxOutputTokens: 800 },
+        },
+        { timeout: 25000 },
+      );
+
+      const replyText =
+        response.data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+        "Désolé, je n'ai pas pu générer de réponse.";
+
+      console.log(`[Gemini] OK avec clé #${attempt + 1}/${attempts}`);
+      return replyText;
+    } catch (err) {
+      lastError = err;
+      const status = err.response?.status;
+      const msg = err.response?.data || err.message;
+      console.error(`[Gemini] échec clé #${attempt + 1}/${attempts} (HTTP ${status || 'réseau'}) :`, msg);
+
+      // Quota / auth / rate-limit → essayer la clé suivante
+      if (status === 429 || status === 403 || status === 401 || status === 400) {
+        continue;
+      }
+      // Timeout / réseau → essayer aussi la clé suivante
+      if (!status || err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+        continue;
+      }
+      // Autre erreur HTTP : on continue quand même pour maximiser les chances
+      continue;
+    }
+  }
+
+  const e = new Error('ALL_GEMINI_KEYS_FAILED');
+  e.code = 'ALL_GEMINI_KEYS_FAILED';
+  e.cause = lastError;
+  throw e;
+}
+
 router.post(
   '/ai/chat',
   requireAuth,
   requireRole('agriculteur'),
   asyncHandler(async (req, res) => {
-    if (!GEMINI_API_KEY) {
+    if (GEMINI_API_KEYS.length === 0) {
       return res.status(503).json({
-        message: 'Service IA non configuré (GEMINI_API_KEY manquante côté serveur).',
+        message: 'Service IA non configuré (aucune clé Gemini côté serveur).',
       });
     }
     const { message, sessionId } = req.body;
@@ -1500,32 +1587,27 @@ router.post(
 
     const contents = [
       { role: 'user', parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
-      { role: 'model', parts: [{ text: "Compris, je suis prêt à aider." }] },
+      { role: 'model', parts: [{ text: 'Compris, je suis prêt à aider.' }] },
       ...history,
       { role: 'user', parts: [{ text: message }] },
     ];
 
     try {
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          contents,
-          generationConfig: { temperature: 0.6, maxOutputTokens: 800 },
-        },
-      );
-
-      const replyText =
-        response.data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        "Désolé, je n'ai pas pu générer de réponse.";
+      const replyText = await callGeminiWithRotation(contents);
 
       history.push({ role: 'user', parts: [{ text: message }] });
       history.push({ role: 'model', parts: [{ text: replyText }] });
-      chatHistories.set(sid, history.slice(-20)); // garde les 20 derniers échanges
+      chatHistories.set(sid, history.slice(-20));
 
       res.json({ reply: replyText, sessionId: sid });
     } catch (err) {
-      console.error('[Gemini] erreur :', err.response?.data || err.message);
-      res.status(502).json({ message: 'Erreur du service IA. Réessayez.' });
+      console.error('[Gemini] toutes les clés ont échoué :', err.cause?.response?.data || err.message);
+      res.status(502).json({
+        message:
+          err.code === 'ALL_GEMINI_KEYS_FAILED'
+            ? 'Toutes les clés API Gemini sont épuisées ou invalides. Réessayez plus tard.'
+            : 'Erreur du service IA. Réessayez.',
+      });
     }
   }),
 );
@@ -2282,7 +2364,8 @@ app.get('/health', async (req, res) => {
       status: 'ok',
       database: 'connected',
       redis: redisClient ? 'configured' : 'fallback_memoire',
-      geminiConfigured: !!GEMINI_API_KEY,
+      geminiConfigured: GEMINI_API_KEYS.length > 0,
+      geminiKeysCount: GEMINI_API_KEYS.length,
       uptime: process.uptime(),
     });
   } catch (err) {
