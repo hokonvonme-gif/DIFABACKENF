@@ -1527,18 +1527,18 @@ function buildGeminiSystemPrompt(langCode) {
   return `Tu es l'assistant agricole de Difa, une plateforme togolaise qui connecte
 agriculteurs, agronomes, acheteurs et transporteurs.
 
-RÈGLE OBLIGATOIRE SUR LA LANGUE :
-- Tu dois répondre UNIQUEMENT en ${langName} (code langue : ${code}).
-- Même si l'utilisateur écrit dans une autre langue, réponds en ${langName}.
-- N'utilise aucune autre langue dans ta réponse.
+LANGUE DE RÉPONSE (priorité) :
+1. Si l'utilisateur demande explicitement une autre langue (ex: "réponds en français", "in English"), utilise cette langue.
+2. Sinon, réponds en ${langName} (code : ${code}) — c'est la langue de l'application de l'utilisateur.
+3. Ne refuse JAMAIS de changer de langue si l'utilisateur le demande.
+4. N'écris pas de phrases du type "I must communicate only in English".
 
-RÈGLE OBLIGATOIRE SUR LE FORMAT :
-- Texte brut uniquement : PAS de markdown, PAS d'astérisques **, PAS de #, PAS de listes à puces markdown.
+FORMAT :
+- Texte brut uniquement : PAS de markdown, PAS d'astérisques **, PAS de #.
 - Pas de gras, pas d'italique, pas de backticks.
-- Utilise des phrases claires et des tirets simples "-" si tu listes des points.
-- Pas de titres markdown.
+- Listes avec de simples tirets "-" si besoin.
 
-Contenu :
+CONTENU :
 Tu réponds UNIQUEMENT aux questions liées à l'agriculture tropicale et
 togolaise : cultures locales (maïs, manioc, igname, tomate, riz, coton...),
 calendrier agricole, irrigation, engrais, maladies des plantes, techniques
@@ -1645,21 +1645,33 @@ router.post(
         message: 'Service IA non configuré (aucune clé Gemini côté serveur).',
       });
     }
-    const { message, sessionId } = req.body;
+    const { message, sessionId, language } = req.body;
     if (!message) return res.status(400).json({ message: 'Message requis.' });
 
-    // Langue de l'utilisateur (préférée en base, sinon fr)
+    // Priorité : langue envoyée par l'app (UI) > preferred_language en base > fr
     let lang = 'fr';
+    if (language && typeof language === 'string') {
+      lang = language.split('-')[0].toLowerCase();
+    } else {
+      try {
+        const u = await pool.query('SELECT preferred_language FROM users WHERE id = $1', [
+          req.user.id,
+        ]);
+        if (u.rows[0]?.preferred_language) lang = u.rows[0].preferred_language;
+      } catch (_) {}
+    }
+
+    // Synchronise la langue de l'app en base (notifs + futurs chats)
     try {
-      const u = await pool.query('SELECT preferred_language FROM users WHERE id = $1', [
-        req.user.id,
-      ]);
-      if (u.rows[0]?.preferred_language) lang = u.rows[0].preferred_language;
+      await pool.query(
+        'UPDATE users SET preferred_language = $1 WHERE id = $2',
+        [lang, req.user.id],
+      );
     } catch (_) {}
 
     const sid = sessionId || req.user.id;
-    // Historique par session + langue (évite de mélanger FR/EN dans le même contexte)
-    const historyKey = `${sid}:${lang}`;
+    // Historique par session uniquement (la langue peut changer en cours de route)
+    const historyKey = String(sid);
     const history = chatHistories.get(historyKey) || [];
 
     const systemPrompt = buildGeminiSystemPrompt(lang);
@@ -1671,9 +1683,7 @@ router.post(
         parts: [
           {
             text:
-              lang === 'en'
-                ? 'Understood. I will reply only in English, in plain text without markdown.'
-                : 'Compris. Je répondrai uniquement dans la langue demandée, en texte simple sans markdown.',
+              'Compris. Je réponds dans la langue de l\'application, ou dans celle demandée par l\'utilisateur, en texte simple sans markdown.',
           },
         ],
       },
@@ -1908,6 +1918,19 @@ router.get(
 
 /** Textes de notifications multilingues (type -> langue -> { title, body }) */
 const NOTIF_I18N = {
+  test_push: {
+    fr: { title: 'Test Difa', body: 'Si vous lisez ceci, les notifications push fonctionnent.' },
+    en: { title: 'Difa Test', body: 'If you see this, push notifications work.' },
+    ee: { title: 'Difa Test', body: 'Push notifications work.' },
+    ha: { title: 'Difa Test', body: 'Push notifications work.' },
+    es: { title: 'Prueba Difa', body: 'Si ves esto, las notificaciones funcionan.' },
+    pt: { title: 'Teste Difa', body: 'Se estiver a ver isto, as notificações funcionam.' },
+    ar: { title: 'اختبار ديفا', body: 'إذا رأيت هذا، فالإشعارات تعمل.' },
+    zh: { title: 'Difa 测试', body: '如果您看到此消息，推送通知正常。' },
+    yo: { title: 'Difa Test', body: 'Push notifications work.' },
+    kbp: { title: 'Test Difa', body: 'Si vous lisez ceci, les notifications push fonctionnent.' },
+  },
+
   produit_soumis: {
     fr: { title: 'Produit soumis', body: 'Votre produit "{name}" est en attente de validation.' },
     en: { title: 'Product submitted', body: 'Your product "{name}" is pending validation.' },
@@ -2070,12 +2093,21 @@ async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
     try {
       const tokens = (
         await pool.query('SELECT fcm_token FROM push_tokens WHERE user_id = $1', [userId])
-      ).rows.map((r) => r.fcm_token);
+      ).rows.map((r) => r.fcm_token).filter(Boolean);
 
-      if (tokens.length > 0) {
-        await firebaseMessaging.sendEachForMulticast({
+      if (tokens.length === 0) {
+        console.log(`[Push] Aucun token FCM pour user ${userId} — notif in-app seulement.`);
+      } else {
+        const resp = await firebaseMessaging.sendEachForMulticast({
           tokens,
           notification: { title, body },
+          android: {
+            priority: 'high',
+            notification: {
+              channelId: 'difa_notifications',
+              sound: 'default',
+            },
+          },
           data: {
             type: String(type),
             ...(data
@@ -2083,10 +2115,22 @@ async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
               : {}),
           },
         });
+        console.log(
+          `[Push] Envoyé type=${type} user=${userId} success=${resp.successCount} failure=${resp.failureCount}`,
+        );
+        if (resp.failureCount > 0 && resp.responses) {
+          resp.responses.forEach((r, i) => {
+            if (!r.success) {
+              console.error(`[Push] Token #${i} erreur :`, r.error?.message || r.error);
+            }
+          });
+        }
       }
     } catch (err) {
       console.error('[Push] Échec envoi notification :', err.message);
     }
+  } else {
+    console.log('[Push] Firebase non initialisé — notif in-app seulement.');
   }
 }
 
@@ -2102,6 +2146,41 @@ router.post(
       [crypto.randomUUID(), req.user.id, fcmToken],
     );
     res.json({ message: 'Token enregistré.' });
+  }),
+);
+
+
+
+router.post(
+  '/notifications/test-push',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const tokens = (
+      await pool.query('SELECT fcm_token FROM push_tokens WHERE user_id = $1', [req.user.id])
+    ).rows.map((r) => r.fcm_token).filter(Boolean);
+
+    if (!firebaseMessaging) {
+      return res.status(503).json({
+        message: 'Firebase non initialisé côté serveur. Vérifiez FIREBASE_* sur Render.',
+        tokensRegistered: tokens.length,
+      });
+    }
+    if (tokens.length === 0) {
+      return res.status(400).json({
+        message:
+          'Aucun token FCM enregistré pour ce compte. Rouvrez l\'app, acceptez les notifications, puis reconnectez-vous.',
+        tokensRegistered: 0,
+      });
+    }
+
+    await notifyUser(req.user.id, 'test_push', {
+      name: 'Difa',
+    });
+
+    res.json({
+      message: 'Notification de test envoyée.',
+      tokensRegistered: tokens.length,
+    });
   }),
 );
 
