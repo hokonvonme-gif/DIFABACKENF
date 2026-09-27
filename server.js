@@ -2119,11 +2119,25 @@ async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
           `[Push] Envoyé type=${type} user=${userId} success=${resp.successCount} failure=${resp.failureCount}`,
         );
         if (resp.failureCount > 0 && resp.responses) {
-          resp.responses.forEach((r, i) => {
+          for (let i = 0; i < resp.responses.length; i++) {
+            const r = resp.responses[i];
             if (!r.success) {
-              console.error(`[Push] Token #${i} erreur :`, r.error?.message || r.error);
+              const code = r.error?.code || '';
+              const msg = r.error?.message || String(r.error);
+              console.error(`[Push] Token #${i} erreur :`, msg);
+              // Token invalide / app désinstallée → on le retire de la base
+              if (
+                code.includes('registration-token-not-registered') ||
+                code.includes('invalid-registration-token') ||
+                /NotRegistered|InvalidRegistration/i.test(msg)
+              ) {
+                try {
+                  await pool.query('DELETE FROM push_tokens WHERE fcm_token = $1', [tokens[i]]);
+                  console.log(`[Push] Token invalide supprimé de la base.`);
+                } catch (_) {}
+              }
             }
-          });
+          }
         }
       }
     } catch (err) {
@@ -2140,12 +2154,19 @@ router.post(
   asyncHandler(async (req, res) => {
     const { fcmToken } = req.body;
     if (!fcmToken) return res.status(400).json({ message: 'fcmToken requis.' });
+
+    // Un seul token actif par appareil : on retire les anciens tokens de cet utilisateur
+    // puis on enregistre le nouveau (évite les NotRegistered cumulés).
+    await pool.query('DELETE FROM push_tokens WHERE user_id = $1 OR fcm_token = $2', [
+      req.user.id,
+      fcmToken,
+    ]);
     await pool.query(
-      `INSERT INTO push_tokens (id, user_id, fcm_token) VALUES ($1,$2,$3)
-       ON CONFLICT (fcm_token) DO UPDATE SET user_id = $2`,
+      `INSERT INTO push_tokens (id, user_id, fcm_token) VALUES ($1,$2,$3)`,
       [crypto.randomUUID(), req.user.id, fcmToken],
     );
-    res.json({ message: 'Token enregistré.' });
+    console.log(`[Push] Token FCM enregistré pour user ${req.user.id}`);
+    res.status(204).send();
   }),
 );
 
