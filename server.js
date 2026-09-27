@@ -2100,16 +2100,24 @@ async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
       } else {
         const resp = await firebaseMessaging.sendEachForMulticast({
           tokens,
+          // Bloc notification = affichage système (app fermée / arrière-plan / verrouillé)
           notification: { title, body },
           android: {
             priority: 'high',
             notification: {
               channelId: 'difa_notifications',
               sound: 'default',
+              defaultSound: true,
+              defaultVibrateTimings: true,
+              priority: 'high',
+              visibility: 'public',
             },
           },
+          // data duplique title/body pour le handler background (messages data-only)
           data: {
             type: String(type),
+            title: String(title),
+            body: String(body),
             ...(data
               ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]))
               : {}),
