@@ -912,11 +912,13 @@ router.post(
   requireAuth,
   requireRole('agriculteur'),
   asyncHandler(async (req, res) => {
-    const { typeCulture, dateSemis, superficieHa, typeSol, region, dateRecoltePrevue, photos, notes } =
+    const { typeCulture, dateSemis, superficieHa, typeSol, region, dateRecoltePrevue, photos, notes, language } =
       req.body;
     if (!typeCulture || !dateSemis || !superficieHa || !typeSol || !region) {
       return res.status(400).json({ message: 'Champs requis manquants.' });
     }
+    // Langue de l'écran (prioritaire pour la notification)
+    await applyUserLanguage(req.user.id, language);
     const id = crypto.randomUUID();
     await pool.query(
       `INSERT INTO cultures (id, agriculteur_id, type_culture, date_semis, superficie_ha, type_sol, region, date_recolte_prevue, photos, notes)
@@ -1142,11 +1144,14 @@ router.post(
       region,
       latitude,
       longitude,
+      language,
     } = req.body;
 
     if (!nom || !quantite || !unite || !prixFcfa || !region) {
       return res.status(400).json({ message: 'Champs requis manquants.' });
     }
+    // Langue de l'écran (prioritaire pour la notification)
+    await applyUserLanguage(req.user.id, language);
 
     const id = crypto.randomUUID();
     await pool.query(
@@ -2056,6 +2061,22 @@ function resolveNotifText(type, lang, vars = {}, fallbackTitle, fallbackMessage)
     title: fillTemplate(entry.title, vars),
     body: fillTemplate(entry.body, vars),
   };
+}
+
+/** Met à jour preferred_language si une langue UI valide est fournie */
+async function applyUserLanguage(userId, language) {
+  if (!language || typeof language !== 'string') return null;
+  const code = language.split('-')[0].toLowerCase().slice(0, 8);
+  if (!code) return null;
+  try {
+    await pool.query('UPDATE users SET preferred_language = $1, updated_at = now() WHERE id = $2', [
+      code,
+      userId,
+    ]);
+    return code;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
