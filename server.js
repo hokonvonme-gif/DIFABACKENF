@@ -1928,7 +1928,7 @@ const NOTIF_I18N = {
     ar: { title: 'اختبار ديفا', body: 'إذا رأيت هذا، فالإشعارات تعمل.' },
     zh: { title: 'Difa 测试', body: '如果您看到此消息，推送通知正常。' },
     yo: { title: 'Difa Test', body: 'Push notifications work.' },
-    kbp: { title: 'Test Difa', body: 'Si vous lisez ceci, les notifications push fonctionnent.' },
+    kbp: { title: 'Difa kpɔndʋ', body: 'Ñɛ ka naa se, push notification wɛ nyuie.' },
   },
 
   produit_soumis: {
@@ -1941,7 +1941,7 @@ const NOTIF_I18N = {
     ar: { title: 'تم إرسال المنتج', body: 'منتجك "{name}" في انتظار التحقق.' },
     zh: { title: '产品已提交', body: '您的产品“{name}”正在等待审核。' },
     yo: { title: 'Ọja ti firanṣẹ', body: 'Ọja rẹ "{name}" ń dúró fún ìjẹ́rìísí.' },
-    kbp: { title: 'Produit soumis', body: 'Wà produit "{name}" le kpɔɖeŋu dzi.' },
+    kbp: { title: 'Nusi lɩzɩ', body: 'Wà nusi "{name}" wɛ kpɔndʋ yɔɔ.' },
   },
   produit_valide: {
     fr: { title: 'Produit certifié', body: 'Votre produit "{name}" a été validé avec le badge {badge}.' },
@@ -1953,7 +1953,7 @@ const NOTIF_I18N = {
     ar: { title: 'منتج معتمد', body: 'تم التحقق من منتجك "{name}" بشارة {badge}.' },
     zh: { title: '产品已认证', body: '您的产品“{name}”已通过认证，徽章：{badge}。' },
     yo: { title: 'Ọja ti jẹ́rìísí', body: 'Ọja rẹ "{name}" ti jẹ́rìísí pẹ̀lú àmì {badge}.' },
-    kbp: { title: 'Produit certifié', body: 'Wà produit "{name}" kpe ɖe eŋu kple badge {badge}.' },
+    kbp: { title: 'Nusi ɖɔ', body: 'Wà nusi "{name}" ɖɔ badge {badge} yɔɔ.' },
   },
   produit_rejete: {
     fr: { title: 'Produit rejeté', body: 'Votre produit "{name}" a été rejeté.{reason}' },
@@ -1989,7 +1989,7 @@ const NOTIF_I18N = {
     ar: { title: 'تم تسجيل المحصول', body: 'تم تسجيل محصولك "{name}" بنجاح.' },
     zh: { title: '作物已保存', body: '您的作物“{name}”已保存。' },
     yo: { title: 'Iṣẹ́-ọgbìn ti fi pamọ́', body: 'Iṣẹ́-ọgbìn rẹ "{name}" ti fi pamọ́.' },
-    kbp: { title: 'Culture enregistrée', body: 'Wà culture "{name}" ŋlɔ nyuie.' },
+    kbp: { title: 'Wenaa lɩzɩ', body: 'Wà wenaa "{name}" lɩzɩ nyuie.' },
   },
   transporteur_en_route: {
     fr: { title: 'Transporteur trouvé', body: 'Un transporteur a accepté votre commande et va la récupérer.' },
@@ -2001,7 +2001,7 @@ const NOTIF_I18N = {
     ar: { title: 'تم العثور على ناقل', body: 'قبل ناقل طلبك وسيقوم باستلامه.' },
     zh: { title: '已找到运输商', body: '运输商已接受您的订单并将取货。' },
     yo: { title: 'A ti rí awakọ̀', body: 'Awakọ̀ kan ti gba àṣẹ rẹ yóò sì gbé e.' },
-    kbp: { title: 'Transporteur trouvé', body: 'Transporteur lɔ wà commande.' },
+    kbp: { title: 'Tɩlɩyʊ wɛ ŋgbe', body: 'Tɩlɩyʊ wɛ ŋgbe mission yɔɔ.' },
   },
   livraison_arrivee: {
     fr: { title: 'Livraison effectuée', body: 'Votre commande a été livrée avec succès.' },
@@ -2025,7 +2025,7 @@ const NOTIF_I18N = {
     ar: { title: 'تم تأكيد الدفع', body: 'تم استلام دفعتك بمبلغ {amount} فرنك بنجاح.' },
     zh: { title: '付款已确认', body: '已成功收到您 {amount} FCFA 的付款。' },
     yo: { title: 'Ìsanwó ti jẹ́rìísí', body: 'A ti gba ìsanwó rẹ {amount} FCFA ní àṣeyọrí.' },
-    kbp: { title: 'Paiement confirmé', body: 'Woxɔ wà ga {amount} FCFA nyuie.' },
+    kbp: { title: 'Liidiye ɖɔ', body: 'Woxɔ wà liidiye {amount} FCFA nyuie.' },
   },
   certification_en_attente: {
     fr: { title: 'Nouvelle certification', body: 'Un produit "{name}" attend votre inspection.' },
@@ -2037,7 +2037,7 @@ const NOTIF_I18N = {
     ar: { title: 'شهادة جديدة', body: 'منتج "{name}" ينتظر فحصك.' },
     zh: { title: '新认证请求', body: '产品“{name}”等待您的检查。' },
     yo: { title: 'Ìjẹ́rìísí tuntun', body: 'Ọja "{name}" ń dúró fún àyẹ̀wò rẹ.' },
-    kbp: { title: 'Nouvelle certification', body: 'Produit "{name}" le wà kpɔɖeŋu dzi.' },
+    kbp: { title: 'Certification ɛsɩda', body: 'Nusi "{name}" wɛ wà kpɔndʋ yɔɔ.' },
   },
 };
 
@@ -2078,10 +2078,11 @@ async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
   let lang = 'fr';
   try {
     const u = await pool.query('SELECT preferred_language FROM users WHERE id = $1', [userId]);
-    if (u.rows[0]?.preferred_language) lang = u.rows[0].preferred_language;
+    if (u.rows[0]?.preferred_language) lang = String(u.rows[0].preferred_language).split('-')[0].toLowerCase();
   } catch (_) {}
 
   const { title, body } = resolveNotifText(type, lang, vars, fallbackTitle, fallbackMessage);
+  console.log(`[Push] i18n type=${type} lang=${lang} title="${title}"`);
 
   const id = crypto.randomUUID();
   await pool.query(
@@ -2105,7 +2106,7 @@ async function notifyUser(userId, type, varsOrTitle, maybeMessage, maybeData) {
           android: {
             priority: 'high',
             notification: {
-              channelId: 'difa_notifications',
+              channelId: 'difa_notifications_v2',
               sound: 'default',
               defaultSound: true,
               defaultVibrateTimings: true,
