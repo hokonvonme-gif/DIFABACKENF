@@ -333,7 +333,140 @@ async function initDatabase() {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS preferred_language TEXT DEFAULT 'fr'
   `);
-  console.log('[DB] Tables prêtes.');
+
+  // Module 2 — profils enrichis + KYC + notation
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS note_moyenne NUMERIC(2,1) DEFAULT 5.0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS localisation_lat NUMERIC(9,6);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS localisation_lng NUMERIC(9,6);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_statut TEXT DEFAULT 'non_soumis'
+      CHECK (kyc_statut IN ('non_soumis','en_attente','valide','rejete'));
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_documents JSONB;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS specialites TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS diplomes TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS zone_intervention TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS type_activite TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS volume_habituel TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS type_etablissement TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicule_type TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicule_immat TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS zone_couverture TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS derniere_connexion TIMESTAMPTZ;
+  `);
+
+  // Module 4 — commandes marketplace
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id UUID PRIMARY KEY,
+      acheteur_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      product_id UUID REFERENCES products(id),
+      agriculteur_id UUID REFERENCES users(id),
+      quantite NUMERIC(10,2) NOT NULL,
+      prix_unitaire_fcfa INTEGER NOT NULL,
+      montant_total_fcfa INTEGER NOT NULL,
+      commission_fcfa INTEGER DEFAULT 0,
+      statut TEXT DEFAULT 'en_attente_paiement'
+        CHECK (statut IN (
+          'en_attente_paiement','paye','confirme','en_livraison','livre','annule','refuse'
+        )),
+      adresse_livraison TEXT,
+      destination_lat NUMERIC(9,6),
+      destination_lng NUMERIC(9,6),
+      notes TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      id UUID PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      product_id UUID REFERENCES products(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(user_id, product_id)
+    );
+  `);
+
+  // Module 9 — portefeuille interne
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wallets (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      solde_fcfa INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id UUID PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL CHECK (type IN ('credit','debit')),
+      montant_fcfa INTEGER NOT NULL,
+      motif TEXT,
+      reference_id UUID,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Module 3 — alertes agricoles / calendrier
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agricultural_alerts (
+      id UUID PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      culture_id UUID REFERENCES cultures(id) ON DELETE CASCADE,
+      type_alerte TEXT NOT NULL,
+      titre TEXT NOT NULL,
+      message TEXT NOT NULL,
+      date_prevue DATE,
+      lu BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Module 12 — litiges + config plateforme
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS disputes (
+      id UUID PRIMARY KEY,
+      order_id UUID REFERENCES orders(id),
+      ouvre_par UUID REFERENCES users(id),
+      contre UUID REFERENCES users(id),
+      motif TEXT NOT NULL,
+      description TEXT,
+      statut TEXT DEFAULT 'ouvert' CHECK (statut IN ('ouvert','en_cours','resolu','rejete')),
+      resolution TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS platform_config (
+      cle TEXT PRIMARY KEY,
+      valeur TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Config par défaut commissions
+  await pool.query(`
+    INSERT INTO platform_config (cle, valeur) VALUES
+      ('commission_vente_pct', '5'),
+      ('commission_transport_pct', '10'),
+      ('matching_rayon_km', '50')
+    ON CONFLICT (cle) DO NOTHING
+  `);
+
+  // Enrichir transport_missions
+  await pool.query(`
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS order_id UUID;
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS note_commentaire TEXT;
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS distance_km NUMERIC(10,2);
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS eta_minutes INTEGER;
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS prix_transport_fcfa INTEGER;
+  `);
+
+  // Enrichir transactions
+  await pool.query(`
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS operateur TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS telephone_paiement TEXT;
+  `);
+
+  console.log('[DB] Tables prêtes (12 modules).');
 }
 
 // ============================================================================
@@ -812,6 +945,21 @@ function serializeUser(row) {
     phoneVerified: row.phone_verified,
     isActive: row.is_active,
     preferredLanguage: row.preferred_language || 'fr',
+    noteMoyenne: row.note_moyenne != null ? Number(row.note_moyenne) : 5.0,
+    localisationLat: row.localisation_lat != null ? Number(row.localisation_lat) : null,
+    localisationLng: row.localisation_lng != null ? Number(row.localisation_lng) : null,
+    kycStatut: row.kyc_statut || 'non_soumis',
+    kycDocuments: row.kyc_documents || null,
+    specialites: row.specialites || null,
+    diplomes: row.diplomes || null,
+    zoneIntervention: row.zone_intervention || null,
+    typeActivite: row.type_activite || null,
+    volumeHabituel: row.volume_habituel || null,
+    typeEtablissement: row.type_etablissement || null,
+    vehiculeType: row.vehicule_type || null,
+    vehiculeImmat: row.vehicule_immat || null,
+    zoneCouverture: row.zone_couverture || null,
+    derniereConnexion: row.derniere_connexion || null,
     createdAt: row.created_at,
   };
 }
@@ -830,20 +978,75 @@ router.patch(
   '/users/me',
   requireAuth,
   asyncHandler(async (req, res) => {
-    // Un utilisateur ne peut modifier que ses infos non sensibles
-    const { fullName, email, region, preferredLanguage } = req.body;
+    const {
+      fullName, email, region, preferredLanguage,
+      localisationLat, localisationLng,
+      specialites, diplomes, zoneIntervention,
+      typeActivite, volumeHabituel, typeEtablissement,
+      vehiculeType, vehiculeImmat, zoneCouverture,
+      kycDocuments,
+    } = req.body;
     const lang = preferredLanguage && String(preferredLanguage).slice(0, 8);
+    let kycStatutUpdate = null;
+    if (kycDocuments) kycStatutUpdate = 'en_attente';
     await pool.query(
       `UPDATE users SET
          full_name = COALESCE($1, full_name),
          email = COALESCE($2, email),
          region = COALESCE($3, region),
          preferred_language = COALESCE($4, preferred_language),
+         localisation_lat = COALESCE($5, localisation_lat),
+         localisation_lng = COALESCE($6, localisation_lng),
+         specialites = COALESCE($7, specialites),
+         diplomes = COALESCE($8, diplomes),
+         zone_intervention = COALESCE($9, zone_intervention),
+         type_activite = COALESCE($10, type_activite),
+         volume_habituel = COALESCE($11, volume_habituel),
+         type_etablissement = COALESCE($12, type_etablissement),
+         vehicule_type = COALESCE($13, vehicule_type),
+         vehicule_immat = COALESCE($14, vehicule_immat),
+         zone_couverture = COALESCE($15, zone_couverture),
+         kyc_documents = COALESCE($16, kyc_documents),
+         kyc_statut = COALESCE($17, kyc_statut),
          updated_at = now()
-       WHERE id = $5`,
-      [fullName || null, email || null, region || null, lang || null, req.user.id],
+       WHERE id = $18`,
+      [
+        fullName || null, email || null, region || null, lang || null,
+        localisationLat ?? null, localisationLng ?? null,
+        specialites || null, diplomes || null, zoneIntervention || null,
+        typeActivite || null, volumeHabituel || null, typeEtablissement || null,
+        vehiculeType || null, vehiculeImmat || null, zoneCouverture || null,
+        kycDocuments ? JSON.stringify(kycDocuments) : null,
+        kycStatutUpdate,
+        req.user.id,
+      ],
     );
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    res.json(serializeUser(result.rows[0]));
+  }),
+);
+
+// KYC — admin valide / rejette
+router.patch(
+  '/users/:id/kyc',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const { action, motif } = req.body; // 'valide' | 'rejete'
+    if (!['valide', 'rejete'].includes(action)) {
+      return res.status(400).json({ message: 'action doit être valide ou rejete.' });
+    }
+    await pool.query(
+      `UPDATE users SET kyc_statut = $1, updated_at = now() WHERE id = $2`,
+      [action, req.params.id],
+    );
+    await notifyUser(
+      req.params.id,
+      action === 'valide' ? 'kyc_valide' : 'kyc_rejete',
+      { reason: motif ? ` ${motif}` : '' },
+      { userId: req.params.id },
+    );
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
     res.json(serializeUser(result.rows[0]));
   }),
 );
@@ -1397,6 +1600,460 @@ router.post(
   }),
 );
 
+
+// ============================================================================
+// MODULE 4b — COMMANDES MARKETPLACE (cycle complet)
+// ============================================================================
+
+function serializeOrder(row) {
+  return {
+    id: row.id,
+    acheteurId: row.acheteur_id,
+    productId: row.product_id,
+    agriculteurId: row.agriculteur_id,
+    quantite: Number(row.quantite),
+    prixUnitaireFcfa: row.prix_unitaire_fcfa,
+    montantTotalFcfa: row.montant_total_fcfa,
+    commissionFcfa: row.commission_fcfa || 0,
+    statut: row.statut,
+    adresseLivraison: row.adresse_livraison,
+    destinationLat: row.destination_lat != null ? Number(row.destination_lat) : null,
+    destinationLng: row.destination_lng != null ? Number(row.destination_lng) : null,
+    notes: row.notes,
+    productNom: row.product_nom || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function getCommissionPct(key, fallback) {
+  try {
+    const r = await pool.query('SELECT valeur FROM platform_config WHERE cle = $1', [key]);
+    if (r.rows[0]) return Number(r.rows[0].valeur) || fallback;
+  } catch (_) {}
+  return fallback;
+}
+
+/** Créer une commande (acheteur / restaurant) */
+router.post(
+  '/orders',
+  requireAuth,
+  requireRole('acheteur', 'restaurant'),
+  asyncHandler(async (req, res) => {
+    const { productId, quantite, adresseLivraison, destinationLat, destinationLng, notes } = req.body;
+    if (!productId || !quantite || quantite <= 0) {
+      return res.status(400).json({ message: 'productId et quantite > 0 requis.' });
+    }
+    const prod = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
+    if (!prod.rows[0]) return res.status(404).json({ message: 'Produit introuvable.' });
+    const p = prod.rows[0];
+    if (p.statut !== 'Publié' && !p.badge) {
+      // Autoriser aussi si badge déjà attribué même si statut encore en attente selon workflow
+      if (p.statut === 'Rejeté' || p.statut === 'Épuisé') {
+        return res.status(400).json({ message: 'Produit non disponible à la commande.' });
+      }
+    }
+    if (Number(p.quantite) < Number(quantite)) {
+      return res.status(400).json({ message: 'Quantité insuffisante en stock.' });
+    }
+    const prixUnit = p.prix_fcfa;
+    const montant = Math.round(prixUnit * Number(quantite));
+    const pct = await getCommissionPct('commission_vente_pct', 5);
+    const commission = Math.round(montant * (pct / 100));
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO orders (
+        id, acheteur_id, product_id, agriculteur_id, quantite, prix_unitaire_fcfa,
+        montant_total_fcfa, commission_fcfa, statut, adresse_livraison,
+        destination_lat, destination_lng, notes
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'en_attente_paiement',$9,$10,$11,$12)`,
+      [
+        id, req.user.id, productId, p.agriculteur_id, quantite, prixUnit,
+        montant, commission, adresseLivraison || null,
+        destinationLat || null, destinationLng || null, notes || null,
+      ],
+    );
+    const result = await pool.query(
+      `SELECT o.*, pr.nom AS product_nom FROM orders o
+       LEFT JOIN products pr ON pr.id = o.product_id WHERE o.id = $1`,
+      [id],
+    );
+    await notifyUser(
+      p.agriculteur_id,
+      'nouvelle_commande',
+      { name: p.nom, qty: String(quantite) },
+      { orderId: id, productId },
+    );
+    res.status(201).json(serializeOrder(result.rows[0]));
+  }),
+);
+
+router.get(
+  '/orders/mine',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const role = req.user.role;
+    let sql, params;
+    if (role === 'acheteur' || role === 'restaurant') {
+      sql = `SELECT o.*, pr.nom AS product_nom FROM orders o
+             LEFT JOIN products pr ON pr.id = o.product_id
+             WHERE o.acheteur_id = $1 ORDER BY o.created_at DESC`;
+      params = [req.user.id];
+    } else if (role === 'agriculteur') {
+      sql = `SELECT o.*, pr.nom AS product_nom FROM orders o
+             LEFT JOIN products pr ON pr.id = o.product_id
+             WHERE o.agriculteur_id = $1 ORDER BY o.created_at DESC`;
+      params = [req.user.id];
+    } else if (role === 'admin') {
+      sql = `SELECT o.*, pr.nom AS product_nom FROM orders o
+             LEFT JOIN products pr ON pr.id = o.product_id
+             ORDER BY o.created_at DESC LIMIT 200`;
+      params = [];
+    } else {
+      return res.status(403).json({ message: 'Rôle non autorisé pour les commandes.' });
+    }
+    const result = await pool.query(sql, params);
+    res.json(result.rows.map(serializeOrder));
+  }),
+);
+
+router.get(
+  '/orders/:id',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT o.*, pr.nom AS product_nom FROM orders o
+       LEFT JOIN products pr ON pr.id = o.product_id WHERE o.id = $1`,
+      [req.params.id],
+    );
+    if (!result.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
+    const o = result.rows[0];
+    const uid = req.user.id;
+    if (
+      o.acheteur_id !== uid &&
+      o.agriculteur_id !== uid &&
+      req.user.role !== 'admin'
+    ) {
+      return res.status(403).json({ message: 'Accès refusé.' });
+    }
+    res.json(serializeOrder(o));
+  }),
+);
+
+router.patch(
+  '/orders/:id/cancel',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
+    const o = result.rows[0];
+    if (o.acheteur_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Accès refusé.' });
+    }
+    if (!['en_attente_paiement', 'paye'].includes(o.statut)) {
+      return res.status(400).json({ message: 'Cette commande ne peut plus être annulée.' });
+    }
+    await pool.query(
+      `UPDATE orders SET statut = 'annule', updated_at = now() WHERE id = $1`,
+      [req.params.id],
+    );
+    await notifyUser(o.agriculteur_id, 'commande_annulee', { name: o.id }, { orderId: o.id });
+    res.json({ message: 'Commande annulée.' });
+  }),
+);
+
+// Confirmer réception (acheteur)
+router.patch(
+  '/orders/:id/confirm-delivery',
+  requireAuth,
+  requireRole('acheteur', 'restaurant'),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
+    const o = result.rows[0];
+    if (o.acheteur_id !== req.user.id) return res.status(403).json({ message: 'Accès refusé.' });
+    await pool.query(
+      `UPDATE orders SET statut = 'livre', updated_at = now() WHERE id = $1`,
+      [req.params.id],
+    );
+    // Créditer le portefeuille agriculteur (montant - commission)
+    const net = o.montant_total_fcfa - (o.commission_fcfa || 0);
+    await ensureWallet(o.agriculteur_id);
+    await pool.query(
+      `UPDATE wallets SET solde_fcfa = solde_fcfa + $1, updated_at = now() WHERE user_id = $2`,
+      [net, o.agriculteur_id],
+    );
+    await pool.query(
+      `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+       VALUES ($1,$2,'credit',$3,'Vente produit',$4)`,
+      [crypto.randomUUID(), o.agriculteur_id, net, o.id],
+    );
+    await notifyUser(o.agriculteur_id, 'commande_livree', { amount: String(net) }, { orderId: o.id });
+    res.json({ message: 'Livraison confirmée. Agriculteur crédité.' });
+  }),
+);
+
+// ============================================================================
+// FAVORIS
+// ============================================================================
+
+router.post(
+  '/favorites',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { productId } = req.body;
+    if (!productId) return res.status(400).json({ message: 'productId requis.' });
+    const id = crypto.randomUUID();
+    try {
+      await pool.query(
+        `INSERT INTO favorites (id, user_id, product_id) VALUES ($1,$2,$3)
+         ON CONFLICT (user_id, product_id) DO NOTHING`,
+        [id, req.user.id, productId],
+      );
+    } catch (e) {
+      return res.status(400).json({ message: 'Impossible d\'ajouter aux favoris.' });
+    }
+    res.status(201).json({ message: 'Ajouté aux favoris.' });
+  }),
+);
+
+router.delete(
+  '/favorites/:productId',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await pool.query('DELETE FROM favorites WHERE user_id = $1 AND product_id = $2', [
+      req.user.id,
+      req.params.productId,
+    ]);
+    res.json({ message: 'Retiré des favoris.' });
+  }),
+);
+
+router.get(
+  '/favorites',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT p.* FROM favorites f
+       JOIN products p ON p.id = f.product_id
+       WHERE f.user_id = $1 ORDER BY f.created_at DESC`,
+      [req.user.id],
+    );
+    res.json(result.rows.map(serializeProduct));
+  }),
+);
+
+// ============================================================================
+// MODULE 9b — PORTEFEUILLE INTERNE
+// ============================================================================
+
+async function ensureWallet(userId) {
+  await pool.query(
+    `INSERT INTO wallets (user_id, solde_fcfa) VALUES ($1, 0)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [userId],
+  );
+}
+
+router.get(
+  '/wallet',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await ensureWallet(req.user.id);
+    const w = await pool.query('SELECT * FROM wallets WHERE user_id = $1', [req.user.id]);
+    const tx = await pool.query(
+      `SELECT * FROM wallet_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id],
+    );
+    res.json({
+      soldeFcfa: w.rows[0].solde_fcfa,
+      transactions: tx.rows.map((r) => ({
+        id: r.id,
+        type: r.type,
+        montantFcfa: r.montant_fcfa,
+        motif: r.motif,
+        referenceId: r.reference_id,
+        createdAt: r.created_at,
+      })),
+    });
+  }),
+);
+
+// ============================================================================
+// MODULE 3b — ALERTES AGRICOLES / CALENDRIER
+// ============================================================================
+
+router.get(
+  '/alerts/mine',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT * FROM agricultural_alerts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id],
+    );
+    res.json(
+      result.rows.map((r) => ({
+        id: r.id,
+        cultureId: r.culture_id,
+        typeAlerte: r.type_alerte,
+        titre: r.titre,
+        message: r.message,
+        datePrevue: r.date_prevue,
+        lu: r.lu,
+        createdAt: r.created_at,
+      })),
+    );
+  }),
+);
+
+router.post(
+  '/alerts/generate/:cultureId',
+  requireAuth,
+  requireRole('agriculteur'),
+  asyncHandler(async (req, res) => {
+    const cult = await pool.query(
+      'SELECT * FROM cultures WHERE id = $1 AND agriculteur_id = $2',
+      [req.params.cultureId, req.user.id],
+    );
+    if (!cult.rows[0]) return res.status(404).json({ message: 'Culture introuvable.' });
+    const c = cult.rows[0];
+    const alerts = [
+      {
+        type: 'arrosage',
+        titre: 'Rappel arrosage',
+        message: `Pensez à contrôler l'humidité de votre culture ${c.type_culture}.`,
+        days: 3,
+      },
+      {
+        type: 'traitement',
+        titre: 'Contrôle phytosanitaire',
+        message: `Vérifiez l'apparition de maladies sur ${c.type_culture}.`,
+        days: 7,
+      },
+      {
+        type: 'recolte',
+        titre: 'Récolte approche',
+        message: c.date_recolte_prevue
+          ? `Récolte prévue le ${c.date_recolte_prevue} pour ${c.type_culture}.`
+          : `Planifiez la récolte de ${c.type_culture}.`,
+        days: 14,
+      },
+    ];
+    const created = [];
+    for (const a of alerts) {
+      const id = crypto.randomUUID();
+      const d = new Date();
+      d.setDate(d.getDate() + a.days);
+      await pool.query(
+        `INSERT INTO agricultural_alerts (id, user_id, culture_id, type_alerte, titre, message, date_prevue)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [id, req.user.id, c.id, a.type, a.titre, a.message, d.toISOString().slice(0, 10)],
+      );
+      created.push(a.titre);
+      await notifyUser(req.user.id, 'alerte_agricole', { title: a.titre, msg: a.message }, {
+        cultureId: c.id,
+      });
+    }
+    res.status(201).json({ message: 'Alertes générées.', items: created });
+  }),
+);
+
+// ============================================================================
+// MODULE 12b — LITIGES + CONFIG
+// ============================================================================
+
+router.post(
+  '/disputes',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { orderId, contreUserId, motif, description } = req.body;
+    if (!motif) return res.status(400).json({ message: 'motif requis.' });
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO disputes (id, order_id, ouvre_par, contre, motif, description)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [id, orderId || null, req.user.id, contreUserId || null, motif, description || null],
+    );
+    // Notifier admins
+    const admins = await pool.query(`SELECT id FROM users WHERE role = 'admin' AND is_active = true`);
+    for (const a of admins.rows) {
+      await notifyUser(a.id, 'nouveau_litige', { motif }, { disputeId: id });
+    }
+    res.status(201).json({ id, message: 'Litige ouvert.' });
+  }),
+);
+
+router.get(
+  '/disputes',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT * FROM disputes ORDER BY created_at DESC LIMIT 100`,
+    );
+    res.json(
+      result.rows.map((r) => ({
+        id: r.id,
+        orderId: r.order_id,
+        ouvrePar: r.ouvre_par,
+        contre: r.contre,
+        motif: r.motif,
+        description: r.description,
+        statut: r.statut,
+        resolution: r.resolution,
+        createdAt: r.created_at,
+      })),
+    );
+  }),
+);
+
+router.patch(
+  '/disputes/:id',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const { statut, resolution } = req.body;
+    await pool.query(
+      `UPDATE disputes SET
+         statut = COALESCE($1, statut),
+         resolution = COALESCE($2, resolution),
+         updated_at = now()
+       WHERE id = $3`,
+      [statut || null, resolution || null, req.params.id],
+    );
+    res.json({ message: 'Litige mis à jour.' });
+  }),
+);
+
+router.get(
+  '/admin/config',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query('SELECT * FROM platform_config ORDER BY cle');
+    const cfg = {};
+    for (const r of result.rows) cfg[r.cle] = r.valeur;
+    res.json(cfg);
+  }),
+);
+
+router.patch(
+  '/admin/config',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const entries = Object.entries(req.body || {});
+    for (const [cle, valeur] of entries) {
+      await pool.query(
+        `INSERT INTO platform_config (cle, valeur, updated_at) VALUES ($1,$2,now())
+         ON CONFLICT (cle) DO UPDATE SET valeur = $2, updated_at = now()`,
+        [String(cle), String(valeur)],
+      );
+    }
+    res.json({ message: 'Configuration mise à jour.' });
+  }),
+);
+
 // ============================================================================
 // MODULE 6 & 11 — TRANSPORT & LOGISTIQUE + GPS TEMPS REEL
 // ============================================================================
@@ -1405,6 +2062,7 @@ function serializeMission(row) {
   return {
     id: row.id,
     productId: row.product_id,
+    orderId: row.order_id || null,
     acheteurId: row.acheteur_id,
     transporteurId: row.transporteur_id,
     origineLat: Number(row.origine_lat),
@@ -1415,7 +2073,12 @@ function serializeMission(row) {
     positionActuelleLng: row.position_actuelle_lng ? Number(row.position_actuelle_lng) : null,
     statut: row.statut,
     noteTransporteur: row.note_transporteur ? Number(row.note_transporteur) : null,
+    noteCommentaire: row.note_commentaire || null,
+    distanceKm: row.distance_km != null ? Number(row.distance_km) : null,
+    etaMinutes: row.eta_minutes != null ? Number(row.eta_minutes) : null,
+    prixTransportFcfa: row.prix_transport_fcfa != null ? Number(row.prix_transport_fcfa) : null,
     createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -1505,6 +2168,162 @@ router.get(
     ]);
     if (!result.rows[0]) return res.status(404).json({ message: 'Mission introuvable.' });
     res.json(serializeMission(result.rows[0]));
+  }),
+);
+
+/** Progression statut mission : Acceptée → En route → Arrivée → Livrée */
+router.patch(
+  '/transport/missions/:id/status',
+  requireAuth,
+  requireRole('transporteur'),
+  asyncHandler(async (req, res) => {
+    const { statut, lat, lng } = req.body;
+    const allowed = ['En route', 'Arrivée', 'Livrée'];
+    if (!allowed.includes(statut)) {
+      return res.status(400).json({ message: 'Statut invalide. Utilisez: En route, Arrivée, Livrée.' });
+    }
+    const existing = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ message: 'Mission introuvable.' });
+    if (existing.rows[0].transporteur_id !== req.user.id) {
+      return res.status(403).json({ message: 'Vous n\'êtes pas le transporteur de cette mission.' });
+    }
+    await pool.query(
+      `UPDATE transport_missions SET
+         statut = $1,
+         position_actuelle_lat = COALESCE($2, position_actuelle_lat),
+         position_actuelle_lng = COALESCE($3, position_actuelle_lng),
+         updated_at = now()
+       WHERE id = $4`,
+      [statut, lat ?? null, lng ?? null, req.params.id],
+    );
+    const m = existing.rows[0];
+    if (statut === 'En route') {
+      await notifyUser(m.acheteur_id, 'transporteur_en_route', {}, { missionId: m.id });
+    } else if (statut === 'Arrivée') {
+      await notifyUser(m.acheteur_id, 'livraison_arrivee', {}, { missionId: m.id });
+    } else if (statut === 'Livrée') {
+      await notifyUser(m.acheteur_id, 'livraison_effectuee', {}, { missionId: m.id });
+      if (m.order_id) {
+        await pool.query(
+          `UPDATE orders SET statut = 'en_livraison', updated_at = now() WHERE id = $1 AND statut = 'paye'`,
+          [m.order_id],
+        );
+        await pool.query(
+          `UPDATE orders SET statut = 'livre', updated_at = now() WHERE id = $1`,
+          [m.order_id],
+        );
+      }
+    }
+    // Broadcast socket
+    try {
+      if (typeof io !== 'undefined') {
+        io.to(`mission:${req.params.id}`).emit('missionStatus', {
+          missionId: req.params.id,
+          statut,
+          lat,
+          lng,
+        });
+      }
+    } catch (_) {}
+    const result = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    res.json(serializeMission(result.rows[0]));
+  }),
+);
+
+/** Notation transporteur (acheteur après livraison) */
+router.post(
+  '/transport/missions/:id/rate',
+  requireAuth,
+  requireRole('acheteur', 'restaurant'),
+  asyncHandler(async (req, res) => {
+    const { note, commentaire } = req.body;
+    const n = Number(note);
+    if (!n || n < 1 || n > 5) {
+      return res.status(400).json({ message: 'Note entre 1 et 5 requise.' });
+    }
+    const existing = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ message: 'Mission introuvable.' });
+    const m = existing.rows[0];
+    if (m.acheteur_id !== req.user.id) return res.status(403).json({ message: 'Accès refusé.' });
+    if (m.statut !== 'Livrée') {
+      return res.status(400).json({ message: 'Vous ne pouvez noter qu\'après livraison.' });
+    }
+    await pool.query(
+      `UPDATE transport_missions SET note_transporteur = $1, note_commentaire = $2, updated_at = now() WHERE id = $3`,
+      [n, commentaire || null, req.params.id],
+    );
+    if (m.transporteur_id) {
+      // Recalcul note moyenne transporteur
+      const avg = await pool.query(
+        `SELECT AVG(note_transporteur) AS a FROM transport_missions
+         WHERE transporteur_id = $1 AND note_transporteur IS NOT NULL`,
+        [m.transporteur_id],
+      );
+      const moyenne = Number(avg.rows[0].a) || n;
+      await pool.query('UPDATE users SET note_moyenne = $1 WHERE id = $2', [moyenne, m.transporteur_id]);
+      // Seuil minimum 3/5 — avertissement si sous le seuil
+      if (moyenne < 3) {
+        await notifyUser(m.transporteur_id, 'note_basse', { note: String(moyenne.toFixed(1)) }, {});
+      }
+    }
+    res.json({ message: 'Merci pour votre évaluation.' });
+  }),
+);
+
+/** Créer mission liée à une commande payée */
+router.post(
+  '/transport/missions/from-order',
+  requireAuth,
+  requireRole('acheteur', 'restaurant', 'admin'),
+  asyncHandler(async (req, res) => {
+    const { orderId, origineLat, origineLng, destinationLat, destinationLng } = req.body;
+    if (!orderId || !origineLat || !origineLng || !destinationLat || !destinationLng) {
+      return res.status(400).json({ message: 'orderId et coordonnées requis.' });
+    }
+    const ord = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (!ord.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
+    const o = ord.rows[0];
+    if (o.acheteur_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Accès refusé.' });
+    }
+    if (!['paye', 'confirme'].includes(o.statut)) {
+      return res.status(400).json({ message: 'La commande doit être payée avant le transport.' });
+    }
+    // Distance approx (Haversine simplifiée)
+    const toRad = (d) => (d * Math.PI) / 180;
+    const R = 6371;
+    const dLat = toRad(destinationLat - origineLat);
+    const dLng = toRad(destinationLng - origineLng);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(origineLat)) * Math.cos(toRad(destinationLat)) * Math.sin(dLng / 2) ** 2;
+    const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const prixTransport = Math.max(500, Math.round(dist * 150)); // 150 FCFA/km min 500
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO transport_missions (
+        id, product_id, order_id, acheteur_id, origine_lat, origine_lng,
+        destination_lat, destination_lng, distance_km, prix_transport_fcfa, statut
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'En attente de transporteur')`,
+      [
+        id, o.product_id, orderId, o.acheteur_id,
+        origineLat, origineLng, destinationLat, destinationLng,
+        Math.round(dist * 100) / 100, prixTransport,
+      ],
+    );
+    // Notifier transporteurs de la région
+    const transporters = await pool.query(
+      `SELECT id FROM users WHERE role = 'transporteur' AND is_active = true LIMIT 50`,
+    );
+    for (const tr of transporters.rows) {
+      await notifyUser(tr.id, 'nouvelle_mission', { km: String(Math.round(dist)) }, { missionId: id });
+    }
+    await pool.query(
+      `UPDATE orders SET statut = 'en_livraison', updated_at = now() WHERE id = $1`,
+      [orderId],
+    );
+    const result = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [id]);
+    res.status(201).json(serializeMission(result.rows[0]));
   }),
 );
 
@@ -1871,10 +2690,28 @@ router.post(
     const event = req.body;
     if (event.event === 'charge.success') {
       const tx = await pool.query(
-        `UPDATE transactions SET statut = 'reussi', metadata = $1 WHERE reference_externe = $2 RETURNING user_id, montant_fcfa`,
+        `UPDATE transactions SET statut = 'reussi', metadata = $1 WHERE reference_externe = $2
+         RETURNING user_id, montant_fcfa, order_id`,
         [JSON.stringify(event.data), event.data.reference],
       );
       if (tx.rows[0]) {
+        if (tx.rows[0].order_id) {
+          await pool.query(
+            `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+            [tx.rows[0].order_id],
+          );
+          const ord = await pool.query('SELECT agriculteur_id FROM orders WHERE id = $1', [
+            tx.rows[0].order_id,
+          ]);
+          if (ord.rows[0]) {
+            await notifyUser(
+              ord.rows[0].agriculteur_id,
+              'paiement_recu',
+              { amount: String(tx.rows[0].montant_fcfa) },
+              { orderId: tx.rows[0].order_id },
+            );
+          }
+        }
         await notifyUser(
           tx.rows[0].user_id,
           'paiement_recu',
@@ -1892,16 +2729,136 @@ router.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { montantFcfa, phone, provider, orderId } = req.body;
+    if (!montantFcfa || montantFcfa <= 0) {
+      return res.status(400).json({ message: 'montantFcfa requis.' });
+    }
+    const operateur = (provider || 'tmoney').toLowerCase(); // tmoney | flooz | wave
+    if (!['tmoney', 'flooz', 'wave'].includes(operateur)) {
+      return res.status(400).json({ message: 'provider doit être tmoney, flooz ou wave.' });
+    }
     const id = crypto.randomUUID();
+    const ref = `MM-${operateur.toUpperCase()}-${id.slice(0, 8)}`;
     await pool.query(
-      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut, metadata)
-       VALUES ($1,$2,$3,$4,'mobile_money','en_attente',$5)`,
-      [id, req.user.id, orderId || null, montantFcfa, JSON.stringify({ provider, phone })],
+      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut, reference_externe, operateur, telephone_paiement, metadata)
+       VALUES ($1,$2,$3,$4,'mobile_money','en_attente',$5,$6,$7,$8)`,
+      [
+        id, req.user.id, orderId || null, montantFcfa, ref, operateur,
+        phone || req.user.phone,
+        JSON.stringify({ provider: operateur, phone: phone || req.user.phone, sandbox: true }),
+      ],
     );
-    // TODO : intégrer l'API officielle Togocel (T-Money) ou Moov (Flooz)
-    // une fois les identifiants marchands obtenus.
-    console.warn(`[TODO] Intégration ${provider} à finaliser — transaction ${id} en attente.`);
-    res.json({ transactionId: id, statut: 'en_attente' });
+
+    // Mode sandbox fonctionnel : si MOBILE_MONEY_SANDBOX=true (défaut) on confirme après 2s
+    // En production, brancher l'API officielle T-Money / Flooz / Wave ici.
+    const sandbox = process.env.MOBILE_MONEY_SANDBOX !== 'false';
+    if (sandbox) {
+      setTimeout(async () => {
+        try {
+          await pool.query(
+            `UPDATE transactions SET statut = 'reussi' WHERE id = $1 AND statut = 'en_attente'`,
+            [id],
+          );
+          if (orderId) {
+            await pool.query(
+              `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+              [orderId],
+            );
+            const ord = await pool.query('SELECT agriculteur_id FROM orders WHERE id = $1', [orderId]);
+            if (ord.rows[0]) {
+              await notifyUser(ord.rows[0].agriculteur_id, 'paiement_recu', {
+                amount: String(montantFcfa),
+              }, { orderId });
+            }
+          }
+          await notifyUser(req.user.id, 'paiement_recu', { amount: String(montantFcfa) }, {
+            transactionId: id,
+          });
+          console.log(`[MobileMoney][Sandbox] ${operateur} OK ${ref} ${montantFcfa} FCFA`);
+        } catch (e) {
+          console.error('[MobileMoney][Sandbox] erreur', e.message);
+        }
+      }, 2000);
+    } else {
+      console.warn(`[MobileMoney] Mode prod — brancher API ${operateur} pour ${ref}`);
+    }
+
+    res.json({
+      transactionId: id,
+      reference: ref,
+      statut: sandbox ? 'processing' : 'en_attente',
+      provider: operateur,
+      sandbox,
+      message: sandbox
+        ? 'Paiement sandbox initié — confirmation automatique dans ~2s.'
+        : 'En attente de confirmation opérateur.',
+    });
+  }),
+);
+
+/** Confirmer manuellement un paiement mobile money (webhook opérateur ou admin) */
+router.post(
+  '/payments/mobile-money/confirm',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { transactionId } = req.body;
+    const tx = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+    if (!tx.rows[0]) return res.status(404).json({ message: 'Transaction introuvable.' });
+    if (tx.rows[0].user_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Accès refusé.' });
+    }
+    await pool.query(`UPDATE transactions SET statut = 'reussi' WHERE id = $1`, [transactionId]);
+    if (tx.rows[0].order_id) {
+      await pool.query(
+        `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+        [tx.rows[0].order_id],
+      );
+    }
+    res.json({ message: 'Paiement confirmé.', statut: 'reussi' });
+  }),
+);
+
+/** Payer une commande avec le portefeuille interne */
+router.post(
+  '/payments/wallet/pay',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { orderId } = req.body;
+    if (!orderId) return res.status(400).json({ message: 'orderId requis.' });
+    const ord = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (!ord.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
+    const o = ord.rows[0];
+    if (o.acheteur_id !== req.user.id) return res.status(403).json({ message: 'Accès refusé.' });
+    if (o.statut !== 'en_attente_paiement') {
+      return res.status(400).json({ message: 'Commande déjà traitée.' });
+    }
+    await ensureWallet(req.user.id);
+    const w = await pool.query('SELECT solde_fcfa FROM wallets WHERE user_id = $1', [req.user.id]);
+    if (w.rows[0].solde_fcfa < o.montant_total_fcfa) {
+      return res.status(400).json({ message: 'Solde portefeuille insuffisant.' });
+    }
+    await pool.query(
+      `UPDATE wallets SET solde_fcfa = solde_fcfa - $1, updated_at = now() WHERE user_id = $2`,
+      [o.montant_total_fcfa, req.user.id],
+    );
+    await pool.query(
+      `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+       VALUES ($1,$2,'debit',$3,'Paiement commande',$4)`,
+      [crypto.randomUUID(), req.user.id, o.montant_total_fcfa, orderId],
+    );
+    const txId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut, reference_externe)
+       VALUES ($1,$2,$3,$4,'portefeuille_interne','reussi',$5)`,
+      [txId, req.user.id, orderId, o.montant_total_fcfa, `WALLET-${txId.slice(0, 8)}`],
+    );
+    await pool.query(
+      `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+      [orderId],
+    );
+    await notifyUser(o.agriculteur_id, 'paiement_recu', { amount: String(o.montant_total_fcfa) }, {
+      orderId,
+    });
+    res.json({ message: 'Paiement portefeuille réussi.', transactionId: txId });
   }),
 );
 
@@ -2031,6 +2988,116 @@ const NOTIF_I18N = {
     zh: { title: '付款已确认', body: '已成功收到您 {amount} FCFA 的付款。' },
     yo: { title: 'Ìsanwó ti jẹ́rìísí', body: 'A ti gba ìsanwó rẹ {amount} FCFA ní àṣeyọrí.' },
     kbp: { title: 'Liidiye ɖɔ', body: 'Woxɔ wà liidiye {amount} FCFA nyuie.' },
+  },
+  nouvelle_commande: {
+    fr: { title: 'Nouvelle commande', body: 'Commande reçue pour "{name}" (x{qty}).' },
+    en: { title: 'New order', body: 'Order received for "{name}" (x{qty}).' },
+    ee: { title: 'Asixɔ yeye', body: 'Asixɔ va na "{name}" (x{qty}).' },
+    kbp: { title: 'Caŋ yɔɔdʋ', body: 'Caŋ wɛ "{name}" (x{qty}).' },
+    ha: { title: 'Sabon oda', body: 'An karɓi oda "{name}" (x{qty}).' },
+    yo: { title: 'Aṣẹ tuntun', body: 'Aṣẹ "{name}" (x{qty}).' },
+    es: { title: 'Nuevo pedido', body: 'Pedido de "{name}" (x{qty}).' },
+    pt: { title: 'Novo pedido', body: 'Pedido de "{name}" (x{qty}).' },
+  },
+  commande_annulee: {
+    fr: { title: 'Commande annulée', body: 'Une commande a été annulée.' },
+    en: { title: 'Order cancelled', body: 'An order was cancelled.' },
+    ee: { title: 'Asixɔ ƒe ɖeɖe', body: 'Asixɔ aɖe ɖe ɖe.' },
+    kbp: { title: 'Caŋ kpɛ', body: 'Caŋ kʋ kpɛ.' },
+    ha: { title: 'An soke oda', body: 'An soke wani oda.' },
+    yo: { title: 'A fagile aṣẹ', body: 'A fagile aṣẹ kan.' },
+    es: { title: 'Pedido anulado', body: 'Se anuló un pedido.' },
+    pt: { title: 'Pedido cancelado', body: 'Um pedido foi cancelado.' },
+  },
+  commande_livree: {
+    fr: { title: 'Commande livrée', body: 'Livraison confirmée. +{amount} FCFA crédités.' },
+    en: { title: 'Order delivered', body: 'Delivery confirmed. +{amount} FCFA credited.' },
+    ee: { title: 'Asixɔ wɔ', body: 'Nɔnɔme kɔ. +{amount} FCFA.' },
+    kbp: { title: 'Caŋ tɩ', body: 'Tɩ lɛ. +{amount} FCFA.' },
+    ha: { title: 'An isar da oda', body: 'An tabbatar. +{amount} FCFA.' },
+    yo: { title: 'A ti fi aṣẹ ranṣẹ', body: 'A jẹrisi. +{amount} FCFA.' },
+    es: { title: 'Pedido entregado', body: 'Entrega confirmada. +{amount} FCFA.' },
+    pt: { title: 'Pedido entregue', body: 'Entrega confirmada. +{amount} FCFA.' },
+  },
+  kyc_valide: {
+    fr: { title: 'KYC validé', body: 'Votre identité a été vérifiée.{reason}' },
+    en: { title: 'KYC approved', body: 'Your identity was verified.{reason}' },
+    ee: { title: 'KYC sɔ', body: 'Wò ŋkɔ sɔ.{reason}' },
+    kbp: { title: 'KYC sɔɔlʋ', body: 'Ɛ-yɔɔdʋ sɔɔlʋ.{reason}' },
+    ha: { title: 'KYC an amince', body: 'An tabbatar da kai.{reason}' },
+    yo: { title: 'KYC ti fọwọsi', body: 'A ti ṣayẹwo ẹ.{reason}' },
+    es: { title: 'KYC validado', body: 'Identidad verificada.{reason}' },
+    pt: { title: 'KYC validado', body: 'Identidade verificada.{reason}' },
+  },
+  kyc_rejete: {
+    fr: { title: 'KYC rejeté', body: 'Vérification refusée.{reason}' },
+    en: { title: 'KYC rejected', body: 'Verification refused.{reason}' },
+    ee: { title: 'KYC gbe', body: 'Wogbe.{reason}' },
+    kbp: { title: 'KYC gɛ', body: 'Gɛ.{reason}' },
+    ha: { title: 'KYC an ƙi', body: 'An ƙi.{reason}' },
+    yo: { title: 'KYC kọ', body: 'A kọ.{reason}' },
+    es: { title: 'KYC rechazado', body: 'Verificación rechazada.{reason}' },
+    pt: { title: 'KYC rejeitado', body: 'Verificação recusada.{reason}' },
+  },
+  alerte_agricole: {
+    fr: { title: '{title}', body: '{msg}' },
+    en: { title: '{title}', body: '{msg}' },
+    ee: { title: '{title}', body: '{msg}' },
+    kbp: { title: '{title}', body: '{msg}' },
+    ha: { title: '{title}', body: '{msg}' },
+    yo: { title: '{title}', body: '{msg}' },
+    es: { title: '{title}', body: '{msg}' },
+    pt: { title: '{title}', body: '{msg}' },
+  },
+  nouvelle_mission: {
+    fr: { title: 'Nouvelle mission', body: 'Mission transport disponible (~{km} km).' },
+    en: { title: 'New mission', body: 'Transport mission available (~{km} km).' },
+    ee: { title: 'Dɔ yeye', body: 'Dɔ transport (~{km} km).' },
+    kbp: { title: 'Tʋmʋ yɔɔdʋ', body: 'Tʋmʋ transport (~{km} km).' },
+    ha: { title: 'Sabon aiki', body: 'Aikin sufuri (~{km} km).' },
+    yo: { title: 'Iṣẹ tuntun', body: 'Iṣẹ gbigbe (~{km} km).' },
+    es: { title: 'Nueva misión', body: 'Misión de transporte (~{km} km).' },
+    pt: { title: 'Nova missão', body: 'Missão de transporte (~{km} km).' },
+  },
+  livraison_arrivee: {
+    fr: { title: 'Transporteur arrivé', body: 'Le transporteur est arrivé au point de livraison.' },
+    en: { title: 'Transporter arrived', body: 'The transporter arrived at the delivery point.' },
+    ee: { title: 'Transport va', body: 'Transport va ɖe afisi.' },
+    kbp: { title: 'Transport wa', body: 'Transport wa tɛ.' },
+    ha: { title: 'Mai sufuri ya iso', body: 'Ya isa wurin bayarwa.' },
+    yo: { title: 'Olugbe de', body: 'Olugbe ti de ibi ifijiṣẹ.' },
+    es: { title: 'Transportista llegó', body: 'Llegó al punto de entrega.' },
+    pt: { title: 'Transportador chegou', body: 'Chegou ao ponto de entrega.' },
+  },
+  livraison_effectuee: {
+    fr: { title: 'Livraison effectuée', body: 'Votre colis a été livré. Confirmez la réception.' },
+    en: { title: 'Delivery done', body: 'Your package was delivered. Please confirm.' },
+    ee: { title: 'Nɔnɔme wɔ', body: 'Nɔnɔme wɔ. Kɔe.' },
+    kbp: { title: 'Tɩ lɛ', body: 'Tɩ lɛ. Sɔɔlʋ.' },
+    ha: { title: 'An isar', body: 'An isar da kaya. Tabbatar.' },
+    yo: { title: 'Ti fi ranṣẹ', body: 'A ti fi ranṣẹ. Jẹrisi.' },
+    es: { title: 'Entrega realizada', body: 'Paquete entregado. Confirme.' },
+    pt: { title: 'Entrega feita', body: 'Encomenda entregue. Confirme.' },
+  },
+  nouveau_litige: {
+    fr: { title: 'Nouveau litige', body: 'Litige ouvert : {motif}' },
+    en: { title: 'New dispute', body: 'Dispute opened: {motif}' },
+    ee: { title: 'Nya yeye', body: 'Nya : {motif}' },
+    kbp: { title: 'Nyɔŋ yɔɔdʋ', body: 'Nyɔŋ : {motif}' },
+    ha: { title: 'Sabon rikici', body: 'Rikici: {motif}' },
+    yo: { title: 'Ariyanjiyan tuntun', body: 'Ariyanjiyan: {motif}' },
+    es: { title: 'Nueva disputa', body: 'Disputa: {motif}' },
+    pt: { title: 'Nova disputa', body: 'Disputa: {motif}' },
+  },
+  note_basse: {
+    fr: { title: 'Attention note', body: 'Votre note moyenne est de {note}/5. Améliorez votre service.' },
+    en: { title: 'Low rating', body: 'Your average rating is {note}/5. Improve your service.' },
+    ee: { title: 'Note kpakpa', body: 'Note {note}/5.' },
+    kbp: { title: 'Note kɩlɛ', body: 'Note {note}/5.' },
+    ha: { title: 'Ƙarancin maki', body: 'Makin ku {note}/5.' },
+    yo: { title: 'Oṣuwọn kekere', body: 'Oṣuwọn {note}/5.' },
+    es: { title: 'Nota baja', body: 'Su nota media es {note}/5.' },
+    pt: { title: 'Nota baixa', body: 'A sua nota média é {note}/5.' },
   },
   certification_en_attente: {
     fr: { title: 'Nouvelle certification', body: 'Un produit "{name}" attend votre inspection.' },
