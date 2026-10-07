@@ -451,6 +451,15 @@ async function initDatabase() {
     ON CONFLICT (cle) DO NOTHING
   `);
 
+  // Numéros pré-autorisés à s'inscrire en tant qu'admin (max 5 admins au total)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_allowed_phones (
+      phone TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      used_at TIMESTAMPTZ
+    );
+  `);
+
   // Enrichir transport_missions
   await pool.query(`
     ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS order_id UUID;
@@ -709,11 +718,29 @@ router.post(
     if (!USER_ROLES.includes(role)) {
       return res.status(400).json({ message: 'Rôle invalide.' });
     }
-    // Sécurité : le rôle admin ne peut pas être choisi à l'inscription publique
+    // Admin : uniquement si le numéro est pré-autorisé ET moins de 5 admins
     if (role === 'admin') {
-      return res.status(403).json({
-        message: 'Le rôle administrateur ne peut pas être créé par inscription.',
-      });
+      const adminCount = Number(
+        (await pool.query(`SELECT COUNT(*) FROM users WHERE role = 'admin'`)).rows[0].count,
+      );
+      if (adminCount >= 5) {
+        return res.status(403).json({
+          message: 'ADMIN_LIMIT_REACHED',
+        });
+      }
+      const phoneKey = normalizePhone(phone);
+      const allowed = await pool.query(
+        `SELECT phone FROM admin_allowed_phones
+         WHERE REPLACE(REPLACE(phone, '+', ''), ' ', '') = $1
+           AND used_at IS NULL
+         LIMIT 1`,
+        [phoneKey],
+      );
+      if (allowed.rows.length === 0) {
+        return res.status(403).json({
+          message: 'ADMIN_PHONE_NOT_ALLOWED',
+        });
+      }
     }
     if (password.length < 6) {
       return res
@@ -734,6 +761,17 @@ router.post(
        VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
       [id, fullName, phone, email || null, passwordHash, role, region || null],
     );
+
+    if (role === 'admin') {
+      const phoneKey = normalizePhone(phone);
+      await pool.query(
+        `UPDATE admin_allowed_phones
+         SET used_at = now()
+         WHERE REPLACE(REPLACE(phone, '+', ''), ' ', '') = $1
+           AND used_at IS NULL`,
+        [phoneKey],
+      );
+    }
 
     const code = generateOtpCode();
     await storeOtp(phone, code);
