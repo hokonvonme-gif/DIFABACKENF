@@ -709,6 +709,12 @@ router.post(
     if (!USER_ROLES.includes(role)) {
       return res.status(400).json({ message: 'Rôle invalide.' });
     }
+    // Sécurité : le rôle admin ne peut pas être choisi à l'inscription publique
+    if (role === 'admin') {
+      return res.status(403).json({
+        message: 'Le rôle administrateur ne peut pas être créé par inscription.',
+      });
+    }
     if (password.length < 6) {
       return res
         .status(400)
