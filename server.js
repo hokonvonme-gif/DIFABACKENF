@@ -2971,7 +2971,7 @@ const NOTIF_I18N = {
     ar: { title: 'تم رفض المنتج', body: 'تم رفض منتجك "{name}".{reason}' },
     zh: { title: '产品已拒绝', body: '您的产品“{name}”已被拒绝。{reason}' },
     yo: { title: 'A kọ ọja', body: 'A kọ ọja rẹ "{name}".{reason}' },
-    kbp: { title: 'Produit rejeté', body: 'Wogbe wà produit "{name}".{reason}' },
+    kbp: { title: 'Nusi gɛ', body: 'Wà nusi "{name}" gɛ.{reason}' },
   },
   produit_publie: {
     fr: { title: 'Produit publié', body: 'Votre produit "{name}" est maintenant visible sur le marché.' },
@@ -2983,7 +2983,7 @@ const NOTIF_I18N = {
     ar: { title: 'تم نشر المنتج', body: 'منتجك "{name}" مرئي الآن في السوق.' },
     zh: { title: '产品已上架', body: '您的产品“{name}”已在市场上可见。' },
     yo: { title: 'Ọja ti tẹ̀jáde', body: 'Ọja rẹ "{name}" ti hàn ní ọjà báyìí.' },
-    kbp: { title: 'Produit publié', body: 'Wà produit "{name}" le market dzi fifia.' },
+    kbp: { title: 'Nusi lɩzɩ', body: 'Wà nusi "{name}" wɛ asɩda yɔɔ fifia.' },
   },
   culture_ajoutee: {
     fr: { title: 'Culture enregistrée', body: 'Votre culture "{name}" a bien été enregistrée.' },
