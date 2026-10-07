@@ -2466,7 +2466,7 @@ router.post(
   asyncHandler(async (req, res) => {
     if (GEMINI_API_KEYS.length === 0) {
       return res.status(503).json({
-        message: 'Service IA non configuré (aucune clé Gemini côté serveur).',
+        message: "L'assistant est temporairement indisponible. Réessayez plus tard.",
       });
     }
     const { message, sessionId, language } = req.body;
@@ -2529,8 +2529,8 @@ router.post(
       res.status(502).json({
         message:
           err.code === 'ALL_GEMINI_KEYS_FAILED'
-            ? 'Toutes les clés API Gemini sont épuisées ou invalides. Réessayez plus tard.'
-            : 'Erreur du service IA. Réessayez.',
+            ? "L'assistant est temporairement indisponible. Réessayez dans quelques minutes."
+            : "Impossible d'obtenir une réponse pour le moment. Réessayez.",
       });
     }
   }),
@@ -3651,8 +3651,7 @@ app.get('/health', async (req, res) => {
       status: 'ok',
       database: 'connected',
       redis: redisClient ? 'configured' : 'fallback_memoire',
-      geminiConfigured: GEMINI_API_KEYS.length > 0,
-      geminiKeysCount: GEMINI_API_KEYS.length,
+      assistantAvailable: GEMINI_API_KEYS.length > 0,
       uptime: process.uptime(),
     });
   } catch (err) {
