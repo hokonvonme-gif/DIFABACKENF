@@ -1311,7 +1311,7 @@ router.get(
     const offset = (page - 1) * limit;
 
     // Visible dès la publication (validation admin optionnelle ensuite via badge / modération)
-    const conditions = [`statut = 'Publié'`];
+    const conditions = [`statut IN ('Publié', 'En attente de validation')`];
     const values = [];
 
     if (q) {
@@ -2506,7 +2506,7 @@ async function callGeminiWithRotation(contents) {
 router.post(
   '/ai/chat',
   requireAuth,
-  requireRole('agriculteur', 'agronome', 'acheteur', 'restaurant', 'transporteur', 'admin'),
+  requireRole('agriculteur'),
   asyncHandler(async (req, res) => {
     if (GEMINI_API_KEYS.length === 0) {
       return res.status(503).json({
@@ -3630,47 +3630,28 @@ router.patch(
   requireAuth,
   requireRole('admin'),
   asyncHandler(async (req, res) => {
-    const { action, badge } = req.body; // 'approve' | 'reject'
-    if (action !== 'approve' && action !== 'reject') {
-      return res.status(400).json({ message: 'action doit être approve ou reject.' });
-    }
+    const { action } = req.body; // 'approve' | 'reject'
     const statut = action === 'approve' ? 'Publié' : 'Rejeté';
-    const badgeValue = action === 'approve' ? (badge || 'Certifié') : null;
     const prod = await pool.query('SELECT agriculteur_id, nom FROM products WHERE id = $1', [
       req.params.id,
     ]);
-    if (!prod.rows[0]) {
-      return res.status(404).json({ message: 'Produit introuvable.' });
-    }
-    await pool.query(
-      `UPDATE products SET statut = $1, badge = $2, updated_at = now() WHERE id = $3`,
-      [statut, badgeValue, req.params.id],
-    );
-    if (action === 'approve') {
-      await pool.query(
-        `UPDATE certifications SET statut = 'Validée', badge = $1, updated_at = now()
-         WHERE product_id = $2 AND statut IN ('En attente', 'Acceptée')`,
-        [badgeValue, req.params.id],
-      );
-    } else {
-      await pool.query(
-        `UPDATE certifications SET statut = 'Rejetée', updated_at = now()
-         WHERE product_id = $1 AND statut IN ('En attente', 'Acceptée')`,
-        [req.params.id],
-      );
-    }
-    const type = action === 'approve' ? 'produit_publie' : 'produit_rejete';
-    await notifyUser(
-      prod.rows[0].agriculteur_id,
-      type,
-      { name: prod.rows[0].nom, reason: '' },
-      { productId: req.params.id },
-    );
-    res.json({
-      message: `Produit ${action === 'approve' ? 'approuvé' : 'rejeté'}.`,
+    await pool.query('UPDATE products SET statut = $1, updated_at = now() WHERE id = $2', [
       statut,
-      badge: badgeValue,
-    });
+      req.params.id,
+    ]);
+    if (prod.rows[0]) {
+      const type = action === 'approve' ? 'produit_publie' : 'produit_rejete';
+      await notifyUser(
+        prod.rows[0].agriculteur_id,
+        type,
+        {
+          name: prod.rows[0].nom,
+          reason: action === 'reject' ? '' : '',
+        },
+        { productId: req.params.id },
+      );
+    }
+    res.json({ message: `Produit ${action === 'approve' ? 'approuvé' : 'rejeté'}.` });
   }),
 );
 
