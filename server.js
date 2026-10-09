@@ -781,12 +781,12 @@ router.post(
     const payload = {
       userId: id,
       message: 'Code de vérification envoyé par SMS.',
-      debugOtp: code,
+      debugOtp: String(code),
     };
     if (process.env.OTP_HIDE_CODE === 'true') {
       delete payload.debugOtp;
     }
-
+    console.log(`[OTP] Réponse register debugOtp=${payload.debugOtp || '(caché)'}`);
     res.status(201).json(payload);
   }),
 );
