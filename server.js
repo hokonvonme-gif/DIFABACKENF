@@ -777,13 +777,14 @@ router.post(
     await storeOtp(phone, code);
     await sendOtpSms(phone, code);
 
-    // En mode debug (ou si SMS non fiable), on renvoie aussi le code pour tester
+    // Auto-remplissage app : renvoyer le code sauf si OTP_HIDE_CODE=true
     const payload = {
       userId: id,
       message: 'Code de vérification envoyé par SMS.',
+      debugOtp: code,
     };
-    if (process.env.OTP_DEBUG === 'true' || process.env.NODE_ENV !== 'production') {
-      payload.debugOtp = code;
+    if (process.env.OTP_HIDE_CODE === 'true') {
+      delete payload.debugOtp;
     }
 
     res.status(201).json(payload);
@@ -1499,11 +1500,13 @@ function serializeCertification(row) {
   return {
     id: row.id,
     productId: row.product_id,
+    productName: row.product_nom || row.product_name || null,
     agronomeId: row.agronome_id,
     statut: row.statut,
     badge: row.badge,
     commentaire: row.commentaire,
     createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -1513,7 +1516,9 @@ router.get(
   requireRole('agronome', 'admin'),
   asyncHandler(async (req, res) => {
     const result = await pool.query(
-      `SELECT * FROM certifications WHERE statut = 'En attente' ORDER BY created_at ASC`,
+      `SELECT c.*, p.nom AS product_nom FROM certifications c
+       LEFT JOIN products p ON p.id = c.product_id
+       WHERE c.statut = 'En attente' ORDER BY c.created_at ASC`,
     );
     res.json(result.rows.map(serializeCertification));
   }),
