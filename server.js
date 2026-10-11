@@ -2411,15 +2411,16 @@ FORMAT :
 - Pas de gras, pas d'italique, pas de backticks.
 - Listes avec de simples tirets "-" si besoin.
 
+RÔLE UTILISATEUR : le message peut venir d'un agriculteur, agronome, acheteur, restaurant ou transporteur.
+Adapte le ton au besoin (conseil production, qualité, achat, logistique) sans refuser d'accès.
+
 CONTENU :
-Tu réponds UNIQUEMENT aux questions liées à l'agriculture tropicale et
-togolaise : cultures locales (maïs, manioc, igname, tomate, riz, coton...),
+Tu réponds aux questions liées à l'agriculture tropicale et togolaise :
+cultures locales (maïs, manioc, igname, tomate, riz, coton...),
 calendrier agricole, irrigation, engrais, maladies des plantes, techniques
-de production, conservation post-récolte.
-Sois concis, pratique, et adapté aux réalités des petits producteurs
-togolais (accès limité à l'irrigation moderne, saisons sèche/pluvieuse).
-Si la question dépasse ton champ de compétence, invite poliment
-l'agriculteur à contacter un agronome Difa via l'application.`;
+de production, conservation post-récolte, qualité des produits, marché local.
+Sois concis, pratique, et adapté aux réalités du Togo.
+Si la question dépasse ton champ, invite poliment à contacter un agronome Difa via l'application.`;
 }
 
 /** Nettoie le markdown et caractères indésirables des réponses Gemini */
@@ -2511,7 +2512,8 @@ async function callGeminiWithRotation(contents) {
 router.post(
   '/ai/chat',
   requireAuth,
-  requireRole('agriculteur'),
+  // Tous les profils peuvent utiliser l'assistant (pas seulement agriculteur)
+  requireRole('agriculteur', 'agronome', 'acheteur', 'restaurant', 'transporteur', 'admin'),
   asyncHandler(async (req, res) => {
     if (GEMINI_API_KEYS.length === 0) {
       return res.status(503).json({
