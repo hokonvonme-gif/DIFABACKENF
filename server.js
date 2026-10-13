@@ -172,9 +172,22 @@ function validateStartupConfig() {
     console.warn('');
   }
 
-  if (process.env.NODE_ENV === 'production' && (!process.env.JWT_ACCESS_SECRET || process.env.JWT_ACCESS_SECRET === 'changez_moi_en_prod')) {
-    console.error('[Config] ARRÊT : JWT_ACCESS_SECRET par défaut interdit en production.');
-    process.exit(1);
+  if (process.env.NODE_ENV === 'production') {
+    if (!process.env.JWT_ACCESS_SECRET || process.env.JWT_ACCESS_SECRET === 'changez_moi_en_prod') {
+      console.error('[Config] ARRÊT : JWT_ACCESS_SECRET par défaut interdit en production.');
+      process.exit(1);
+    }
+    if (process.env.OTP_DEBUG === 'true') {
+      console.error('[Config] ARRÊT : OTP_DEBUG=true interdit en production (fuite des codes SMS).');
+      process.exit(1);
+    }
+    if (process.env.MOBILE_MONEY_SANDBOX === 'true') {
+      console.error('[Config] ARRÊT : MOBILE_MONEY_SANDBOX=true interdit en production (paiements fictifs).');
+      process.exit(1);
+    }
+    if (process.env.PAYSTACK_SECRET_KEY && process.env.PAYSTACK_SECRET_KEY.startsWith('sk_test_')) {
+      console.warn('[Config] ATTENTION : PAYSTACK_SECRET_KEY est une clé TEST (sk_test_). Passe en sk_live_ pour la prod.');
+    }
   }
 }
 
@@ -743,7 +756,23 @@ app.use(
     },
   }),
 );
-app.use(cors({ origin: '*' })); // à restreindre à ton domaine mobile une fois en prod
+// CORS : en prod, restreindre via CORS_ORIGIN (liste séparée par des virgules).
+// Exemple : CORS_ORIGIN=https://tonapp.com,capacitor://localhost
+const corsOrigins = (process.env.CORS_ORIGIN || '*')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+app.use(
+  cors({
+    origin: corsOrigins.includes('*')
+      ? true
+      : (origin, cb) => {
+          if (!origin || corsOrigins.includes(origin)) return cb(null, true);
+          return cb(new Error('CORS non autorisé'));
+        },
+    credentials: true,
+  }),
+);
 
 // ============================================================================
 // TRADUCTION DES MESSAGES D'ERREUR / SUCCÈS DE L'API (selon l'en-tête Accept-Language)
