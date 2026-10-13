@@ -107,7 +107,7 @@ const OTP_TTL_SECONDS = 5 * 60; // 5 minutes
 const ACCESS_TOKEN_EXPIRES = process.env.JWT_ACCESS_EXPIRES || '15m';
 const REFRESH_TOKEN_DAYS = 30;
 const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || 'changez_moi_en_prod';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
 
 /** Rotation de clés Gemini (comme ESP32) — GEMINI_API_KEYS ou GEMINI_API_KEY(_2.._5) */
 function loadGeminiKeys() {
@@ -493,6 +493,9 @@ async function initDatabase() {
     ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS offered_at TIMESTAMPTZ;
     ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS tried_ids JSONB DEFAULT '[]'::jsonb;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS disponible BOOLEAN DEFAULT false;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'TG';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS devise TEXT DEFAULT 'XOF';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS devise TEXT DEFAULT 'XOF';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS position_updated_at TIMESTAMPTZ;
   `);
 
@@ -1401,6 +1404,8 @@ const API_MESSAGES = {
 };
 
 Object.assign(API_MESSAGES, {
+  'Ce produit est vendu dans une autre devise.': { en: 'This product is sold in another currency.', es: 'Este producto se vende en otra moneda.', pt: 'Este produto é vendido noutra moeda.', ar: 'هذا المنتج يُباع بعملة أخرى.', zh: '该产品以其他货币出售。' },
+  'Recherche indisponible.': { en: 'Search unavailable.', es: 'Búsqueda no disponible.', pt: 'Pesquisa indisponível.', ar: 'البحث غير متاح.', zh: '搜索暂不可用。' },
   'Disponibilité mise à jour.': { en: 'Availability updated.', es: 'Disponibilidad actualizada.', pt: 'Disponibilidade atualizada.', ar: 'تم تحديث التوفر.', zh: '在线状态已更新。' },
   'Position GPS valide requise.': { en: 'A valid GPS position is required.', es: 'Se requiere una posición GPS válida.', pt: 'É necessária uma posição GPS válida.', ar: 'مطلوب موقع GPS صالح.', zh: '需要有效的 GPS 位置。' },
   'Cette mission est proposée à un autre transporteur.': { en: 'This mission is offered to another transporter.', es: 'Esta misión se ofrece a otro transportista.', pt: 'Esta missão foi proposta a outro transportador.', ar: 'هذه المهمة معروضة على ناقل آخر.', zh: '该任务已派给其他运输员。' },
@@ -1532,7 +1537,7 @@ router.post(
   '/auth/register',
   authLimiter,
   asyncHandler(async (req, res) => {
-    const { fullName, phone, password, role, region, email, language } = req.body;
+    const { fullName, phone, password, role, region, email, language, country } = req.body;
 
     if (!fullName || !phone || !password || !role) {
       return res.status(400).json({ message: 'Champs requis manquants.' });
@@ -1579,10 +1584,13 @@ router.post(
     const id = crypto.randomUUID();
 
     await pool.query(
-      `INSERT INTO users (id, full_name, phone, email, password_hash, role, region, phone_verified, preferred_language)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8)`,
+      `INSERT INTO users (id, full_name, phone, email, password_hash, role, region, phone_verified, preferred_language, country, devise)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, $9, $10)`,
       [id, fullName, phone, email || null, passwordHash, role, region || null,
-        String(language || 'fr').split('-')[0].toLowerCase().slice(0, 8)],
+        String(language || 'fr').split('-')[0].toLowerCase().slice(0, 8),
+        // Le pays du compte suit l'indicatif du numéro (résidence), sinon le pays détecté par l'app
+        countryProfile(detectCountryFromPhone(phone) || country).code,
+        countryProfile(detectCountryFromPhone(phone) || country).currency],
     );
 
     if (role === 'admin') {
@@ -1818,6 +1826,8 @@ function serializeUser(row) {
     phoneVerified: row.phone_verified,
     isActive: row.is_active,
     preferredLanguage: row.preferred_language || 'fr',
+    country: row.country || 'TG',
+    devise: row.devise || 'XOF',
     noteMoyenne: row.note_moyenne != null ? Number(row.note_moyenne) : 5.0,
     localisationLat: row.localisation_lat != null ? Number(row.localisation_lat) : null,
     localisationLng: row.localisation_lng != null ? Number(row.localisation_lng) : null,
@@ -2154,6 +2164,10 @@ router.get(
     if (certifieOnly === 'true') {
       conditions.push(`badge IS NOT NULL`);
     }
+    if (req.query.devise && /^[A-Z]{3}$/.test(String(req.query.devise))) {
+      values.push(String(req.query.devise));
+      conditions.push(`COALESCE(devise, 'XOF') = $${values.length}`);
+    }
     if (prixMin) {
       values.push(Number(prixMin));
       conditions.push(`prix_fcfa >= $${values.length}`);
@@ -2231,8 +2245,8 @@ router.post(
 
     const id = crypto.randomUUID();
     await pool.query(
-      `INSERT INTO products (id, agriculteur_id, nom, quantite, unite, prix_fcfa, prix_negociable, date_recolte, description, photos, region, latitude, longitude, statut)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'En attente de validation')`,
+      `INSERT INTO products (id, agriculteur_id, nom, quantite, unite, prix_fcfa, prix_negociable, date_recolte, description, photos, region, latitude, longitude, statut, devise)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'En attente de validation',$14)`,
       [
         id,
         req.user.id,
@@ -2245,8 +2259,9 @@ router.post(
         description || null,
         photos ? JSON.stringify(photos) : null,
         region,
-        latitude || null,
-        longitude || null,
+        validCoord(latitude, longitude) ? latitude : null,
+        validCoord(latitude, longitude) ? longitude : null,
+        await userCurrency(req.user.id),
       ],
     );
 
@@ -2527,8 +2542,15 @@ router.post(
     const prod = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
     if (!prod.rows[0]) return res.status(404).json({ message: 'Produit introuvable.' });
     const p = prod.rows[0];
-    if (p.statut !== 'Publié') {
+    const orderable = process.env.REQUIRE_CERTIFICATION_TO_ORDER === 'true'
+      ? ['Publié']
+      : ['Publié', 'En attente de validation'];
+    if (!orderable.includes(p.statut)) {
       return res.status(400).json({ message: 'Produit non disponible à la commande.' });
+    }
+    const buyerCur = await userCurrency(req.user.id);
+    if ((p.devise || 'XOF') !== buyerCur) {
+      return res.status(400).json({ message: 'Ce produit est vendu dans une autre devise.' });
     }
     if (p.agriculteur_id === req.user.id) {
       return res.status(400).json({ message: 'Vous ne pouvez pas commander votre propre produit.' });
@@ -2547,7 +2569,7 @@ router.post(
          SET quantite = quantite - $1,
              statut = CASE WHEN quantite - $1 <= 0 THEN 'Épuisé' ELSE statut END,
              updated_at = now()
-       WHERE id = $2 AND statut = 'Publié' AND quantite >= $1
+       WHERE id = $2 AND statut IN ('Publié','En attente de validation') AND quantite >= $1
        RETURNING id`,
       [quantite, productId],
     );
@@ -3043,14 +3065,60 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
+// Routage routier GRATUIT : OSRM (OpenStreetMap). Le serveur public de démonstration n'a pas de garantie
+// de service : pour un usage intensif, héberger son propre OSRM et changer ROUTING_URL.
+const ROUTING_URL = (process.env.ROUTING_URL || 'https://router.project-osrm.org').replace(/\/$/, '');
+const routeCache = new Map();
+
+async function getRoadRoute(lat1, lng1, lat2, lng2) {
+  const key = [lat1, lng1, lat2, lng2].map((x) => Number(x).toFixed(3)).join(',');
+  const hit = routeCache.get(key);
+  if (hit && Date.now() - hit.at < 6 * 3600 * 1000) return hit.value;
+  try {
+    const url = `${ROUTING_URL}/route/v1/driving/${Number(lng1)},${Number(lat1)};${Number(lng2)},${Number(lat2)}` +
+      '?overview=full&geometries=geojson&alternatives=false&steps=false';
+    const r = await axios.get(url, {
+      timeout: 8000,
+      headers: { 'User-Agent': 'DifaBackend/1.0 (logistique agricole, Togo)' },
+    });
+    const rt = r.data?.routes?.[0];
+    if (r.data?.code === 'Ok' && rt?.geometry?.coordinates?.length) {
+      let pts = rt.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+      if (pts.length > 400) {
+        const step = Math.ceil(pts.length / 400);
+        pts = pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+      }
+      const value = {
+        source: 'road',
+        distanceKm: Math.round((rt.distance / 1000) * 10) / 10,
+        durationMin: Math.max(1, Math.round(rt.duration / 60)),
+        points: pts,
+      };
+      if (routeCache.size > 500) routeCache.delete(routeCache.keys().next().value);
+      routeCache.set(key, { at: Date.now(), value });
+      return value;
+    }
+  } catch (e) {
+    console.warn('[Route] Service de routage indisponible, estimation en ligne droite :', e.message);
+  }
+  // Repli : ligne droite majorée (les routes sont rarement droites), non mise en cache
+  const km = Math.round(haversineKm(Number(lat1), Number(lng1), Number(lat2), Number(lng2)) * 1.3 * 10) / 10;
+  const speed = await getCommissionPct('transport_speed_kmh', 30);
+  return {
+    source: 'estimate',
+    distanceKm: km,
+    durationMin: Math.max(1, Math.round((km / speed) * 60)),
+    points: [[Number(lat1), Number(lng1)], [Number(lat2), Number(lng2)]],
+  };
+}
+
 const validCoord = (lat, lng) =>
   Number.isFinite(Number(lat)) && Number.isFinite(Number(lng)) &&
   lat !== null && lng !== null && lat !== '' && lng !== '' &&
   Math.abs(Number(lat)) <= 90 && Math.abs(Number(lng)) <= 180;
 
-async function estimateTransport(distKm) {
-  const base = await getCommissionPct('transport_base_fcfa', 500);
-  const perKm = await getCommissionPct('transport_km_fcfa', 150);
+async function estimateTransport(distKm, cur = 'XOF') {
+  const { base, perKm } = await transportTariff(cur);
   const speed = await getCommissionPct('transport_speed_kmh', 30);
   return {
     prixFcfa: Math.max(base, Math.round(distKm * perKm)),
@@ -3097,6 +3165,175 @@ async function findNearbyDrivers(lat, lng, radiusKm, excludeIds = [], limit = 20
     .sort((a, b) => a.distanceKm - b.distanceKm || b.noteMoyenne - a.noteMoyenne)
     .slice(0, limit);
 }
+
+
+// ============================================================================
+// PAYS / DEVISES / GÉOCODAGE (100 % gratuit : OpenStreetMap + taux open.er-api.com)
+// [code]: [nom, devise, symbole, indicatif, langue par défaut, lat, lng, taux de repli (unités pour 1 USD)]
+// ============================================================================
+const COUNTRY_ROWS = {
+  TG: ['Togo', 'XOF', 'FCFA', '228', 'fr', 8.62, 0.82, 600], BJ: ['Bénin', 'XOF', 'FCFA', '229', 'fr', 9.31, 2.32, 600],
+  CI: ["Côte d'Ivoire", 'XOF', 'FCFA', '225', 'fr', 7.54, -5.55, 600], SN: ['Sénégal', 'XOF', 'FCFA', '221', 'fr', 14.5, -14.45, 600],
+  BF: ['Burkina Faso', 'XOF', 'FCFA', '226', 'fr', 12.24, -1.56, 600], ML: ['Mali', 'XOF', 'FCFA', '223', 'fr', 17.57, -3.99, 600],
+  NE: ['Niger', 'XOF', 'FCFA', '227', 'fr', 17.61, 8.08, 600], GW: ['Guinée-Bissau', 'XOF', 'FCFA', '245', 'pt', 11.8, -15.18, 600],
+  CM: ['Cameroun', 'XAF', 'FCFA', '237', 'fr', 7.37, 12.35, 600], GA: ['Gabon', 'XAF', 'FCFA', '241', 'fr', -0.8, 11.61, 600],
+  CG: ['Congo', 'XAF', 'FCFA', '242', 'fr', -0.23, 15.83, 600], TD: ['Tchad', 'XAF', 'FCFA', '235', 'fr', 15.45, 18.73, 600],
+  CF: ['Centrafrique', 'XAF', 'FCFA', '236', 'fr', 6.61, 20.94, 600], GQ: ['Guinée équatoriale', 'XAF', 'FCFA', '240', 'es', 1.65, 10.27, 600],
+  GH: ['Ghana', 'GHS', 'GH₵', '233', 'en', 7.95, -1.02, 12], NG: ['Nigeria', 'NGN', '₦', '234', 'en', 9.08, 8.68, 1500],
+  CD: ['RD Congo', 'CDF', 'FC', '243', 'fr', -4.04, 21.76, 2800], GN: ['Guinée', 'GNF', 'FG', '224', 'fr', 9.95, -9.7, 8600],
+  SL: ['Sierra Leone', 'SLE', 'Le', '232', 'en', 8.46, -11.78, 23], LR: ['Libéria', 'LRD', 'L$', '231', 'en', 6.43, -9.43, 190],
+  GM: ['Gambie', 'GMD', 'D', '220', 'en', 13.44, -15.31, 70], MR: ['Mauritanie', 'MRU', 'UM', '222', 'ar', 21.0, -10.94, 40],
+  MA: ['Maroc', 'MAD', 'DH', '212', 'ar', 31.79, -7.09, 9.8], DZ: ['Algérie', 'DZD', 'DA', '213', 'ar', 28.03, 1.66, 134],
+  TN: ['Tunisie', 'TND', 'DT', '216', 'ar', 33.89, 9.54, 3.1], EG: ['Égypte', 'EGP', 'E£', '20', 'ar', 26.82, 30.8, 48],
+  KE: ['Kenya', 'KES', 'KSh', '254', 'en', -0.02, 37.91, 129], UG: ['Ouganda', 'UGX', 'USh', '256', 'en', 1.37, 32.29, 3700],
+  TZ: ['Tanzanie', 'TZS', 'TSh', '255', 'en', -6.37, 34.89, 2600], RW: ['Rwanda', 'RWF', 'FRw', '250', 'en', -1.94, 29.87, 1400],
+  BI: ['Burundi', 'BIF', 'FBu', '257', 'fr', -3.37, 29.92, 2900], ET: ['Éthiopie', 'ETB', 'Br', '251', 'en', 9.15, 40.49, 130],
+  ZA: ['Afrique du Sud', 'ZAR', 'R', '27', 'en', -30.56, 22.94, 18], ZM: ['Zambie', 'ZMW', 'ZK', '260', 'en', -13.13, 27.85, 25],
+  MZ: ['Mozambique', 'MZN', 'MT', '258', 'pt', -18.67, 35.53, 64], AO: ['Angola', 'AOA', 'Kz', '244', 'pt', -11.2, 17.87, 910],
+  MG: ['Madagascar', 'MGA', 'Ar', '261', 'fr', -18.77, 46.87, 4500],
+  FR: ['France', 'EUR', '€', '33', 'fr', 46.23, 2.21, 0.92], BE: ['Belgique', 'EUR', '€', '32', 'fr', 50.5, 4.47, 0.92],
+  ES: ['Espagne', 'EUR', '€', '34', 'es', 40.46, -3.75, 0.92], PT: ['Portugal', 'EUR', '€', '351', 'pt', 39.4, -8.22, 0.92],
+  GB: ['Royaume-Uni', 'GBP', '£', '44', 'en', 55.38, -3.44, 0.79], US: ['États-Unis', 'USD', '$', '1', 'en', 37.09, -95.71, 1],
+  CN: ['Chine', 'CNY', '¥', '86', 'zh', 35.86, 104.2, 7.2], BR: ['Brésil', 'BRL', 'R$', '55', 'pt', -14.24, -51.93, 5.5],
+};
+const COUNTRIES = {};
+for (const [code, r] of Object.entries(COUNTRY_ROWS)) {
+  COUNTRIES[code] = { code, name: r[0], currency: r[1], symbol: r[2], dial: r[3], language: r[4], center: [r[5], r[6]], fallbackRate: r[7] };
+}
+const DEFAULT_COUNTRY = 'TG';
+
+function countryProfile(code) {
+  const c = COUNTRIES[String(code || '').toUpperCase()] || COUNTRIES[DEFAULT_COUNTRY];
+  return { code: c.code, name: c.name, currency: c.currency, symbol: c.symbol, dial: c.dial, language: c.language, center: c.center };
+}
+
+/** Pays déduit de l'indicatif téléphonique (préfixe le plus long). */
+function detectCountryFromPhone(phone) {
+  const digits = String(phone || '').replace(/[^\d]/g, '');
+  let best = null;
+  for (const c of Object.values(COUNTRIES)) {
+    if (digits.startsWith(c.dial) && (!best || c.dial.length > best.dial.length)) best = c;
+  }
+  return best ? best.code : null;
+}
+
+function nearestCountry(lat, lng) {
+  let best = DEFAULT_COUNTRY, bd = Infinity;
+  for (const c of Object.values(COUNTRIES)) {
+    const d = haversineKm(Number(lat), Number(lng), c.center[0], c.center[1]);
+    if (d < bd) { bd = d; best = c.code; }
+  }
+  return best;
+}
+
+async function userCurrency(userId) {
+  const r = await pool.query('SELECT devise FROM users WHERE id = $1', [userId]);
+  return r.rows[0]?.devise || 'XOF';
+}
+
+// Taux de change réels et gratuits (sans clé), mis en cache 12 h ; repli sur des valeurs approximatives
+let rateCache = { at: 0, rates: null };
+async function getUsdRate(cur) {
+  if (cur === 'USD') return 1;
+  if (!rateCache.rates || Date.now() - rateCache.at > 12 * 3600 * 1000) {
+    try {
+      const r = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 6000 });
+      if (r.data?.result === 'success' && r.data.rates) rateCache = { at: Date.now(), rates: r.data.rates };
+    } catch (e) {
+      console.warn('[Taux] Service de change indisponible, valeurs approximatives :', e.message);
+      rateCache.at = Date.now() - 11 * 3600 * 1000; // réessayer dans ~1 h
+    }
+  }
+  const live = rateCache.rates?.[cur];
+  if (live) return Number(live);
+  const c = Object.values(COUNTRIES).find((x) => x.currency === cur);
+  return c ? c.fallbackRate : 600;
+}
+
+const niceRound = (x) => {
+  if (x <= 0) return 1;
+  const mag = 10 ** Math.max(0, Math.floor(Math.log10(x)) - 1);
+  return Math.max(1, Math.round(x / mag) * mag);
+};
+
+/** Tarifs transport par devise : FCFA = réglages existants ; autres = 0,85 $ + 0,25 $/km convertis. */
+async function transportTariff(cur) {
+  if (cur === 'XOF' || cur === 'XAF') {
+    return {
+      base: await getCommissionPct('transport_base_fcfa', 500),
+      perKm: await getCommissionPct('transport_km_fcfa', 150),
+    };
+  }
+  const base = await getCommissionPct(`transport_base_${cur}`, 0);
+  const perKm = await getCommissionPct(`transport_km_${cur}`, 0);
+  if (base > 0 && perKm > 0) return { base, perKm };
+  const rate = await getUsdRate(cur);
+  return { base: niceRound(0.85 * rate), perKm: niceRound(0.25 * rate) };
+}
+
+const geoLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false, message: { message: 'Trop de requêtes.' } });
+const PHOTON_URL = (process.env.PHOTON_URL || 'https://photon.komoot.io').replace(/\/$/, '');
+const NOMINATIM_URL = (process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org').replace(/\/$/, '');
+const GEO_UA = { 'User-Agent': 'DifaBackend/1.0 (logistique agricole)' };
+const geoCache = new Map();
+const geoCached = (k) => { const h = geoCache.get(k); return h && Date.now() - h.at < 3600 * 1000 ? h.v : null; };
+const geoStore = (k, v) => { if (geoCache.size > 1000) geoCache.delete(geoCache.keys().next().value); geoCache.set(k, { at: Date.now(), v }); return v; };
+
+/** Profil du pays à partir de la position GPS (ou d'un code pays) : devise, indicatif, langue, centre de carte. */
+router.get('/geo/profile', geoLimiter, asyncHandler(async (req, res) => {
+  const { lat, lng, code } = req.query;
+  if (code && COUNTRIES[String(code).toUpperCase()]) return res.json({ ...countryProfile(code), region: null, source: 'code' });
+  if (!validCoord(lat, lng)) return res.json({ ...countryProfile(DEFAULT_COUNTRY), region: null, source: 'default' });
+  const key = `rev:${Number(lat).toFixed(1)},${Number(lng).toFixed(1)}`;
+  let hit = geoCached(key);
+  if (!hit) {
+    try {
+      const r = await axios.get(`${NOMINATIM_URL}/reverse`, {
+        params: { format: 'jsonv2', lat, lon: lng, zoom: 8, addressdetails: 1, 'accept-language': 'fr' },
+        timeout: 7000, headers: GEO_UA,
+      });
+      const cc = String(r.data?.address?.country_code || '').toUpperCase();
+      hit = geoStore(key, { code: COUNTRIES[cc] ? cc : nearestCountry(lat, lng), region: r.data?.address?.state || r.data?.address?.region || null, source: 'osm' });
+    } catch (e) {
+      hit = { code: nearestCountry(lat, lng), region: null, source: 'nearest' };
+    }
+  }
+  res.json({ ...countryProfile(hit.code), region: hit.region, source: hit.source });
+}));
+
+router.get('/geo/countries', asyncHandler(async (req, res) => {
+  res.json(Object.keys(COUNTRIES).map(countryProfile));
+}));
+
+/** Recherche d'adresse / lieu (comme Google Maps) via Photon puis Nominatim : gratuit, sans clé. */
+router.get('/geo/search', geoLimiter, asyncHandler(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 3) return res.json([]);
+  const bias = validCoord(req.query.lat, req.query.lng) ? { lat: Number(req.query.lat), lon: Number(req.query.lng) } : {};
+  const key = `s:${q.toLowerCase()}:${bias.lat ? bias.lat.toFixed(1) : ''}:${bias.lon ? bias.lon.toFixed(1) : ''}`;
+  const hit = geoCached(key);
+  if (hit) return res.json(hit);
+  let out = [];
+  try {
+    const r = await axios.get(`${PHOTON_URL}/api/`, { params: { q, limit: 8, ...bias }, timeout: 7000, headers: GEO_UA });
+    out = (r.data?.features || []).map((f) => {
+      const p = f.properties || {};
+      const [lng, lat] = f.geometry.coordinates;
+      const label = [p.name, p.street && `${p.street}${p.housenumber ? ' ' + p.housenumber : ''}`, p.city || p.town || p.village, p.state, p.country]
+        .filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(', ');
+      return { label, lat, lng, countryCode: String(p.countrycode || '').toUpperCase() || null, region: p.state || null };
+    });
+  } catch (e) {
+    try {
+      const r = await axios.get(`${NOMINATIM_URL}/search`, { params: { format: 'jsonv2', q, limit: 8, addressdetails: 1 }, timeout: 7000, headers: GEO_UA });
+      out = (r.data || []).map((p) => ({
+        label: p.display_name, lat: Number(p.lat), lng: Number(p.lon),
+        countryCode: String(p.address?.country_code || '').toUpperCase() || null, region: p.address?.state || null,
+      }));
+    } catch (e2) { return res.status(503).json({ message: 'Recherche indisponible.' }); }
+  }
+  res.json(geoStore(key, out));
+}));
 
 /** Le transporteur se met en ligne / hors ligne et envoie sa position. */
 router.patch(
@@ -3158,9 +3395,9 @@ router.get(
     if (!validCoord(originLat, originLng) || !validCoord(destinationLat, destinationLng)) {
       return res.status(400).json({ message: 'Coordonnées manquantes.' });
     }
-    const dist = haversineKm(Number(originLat), Number(originLng), Number(destinationLat), Number(destinationLng));
-    const est = await estimateTransport(dist);
-    res.json({ distanceKm: Math.round(dist * 10) / 10, ...est });
+    const rt = await getRoadRoute(originLat, originLng, destinationLat, destinationLng);
+    const est = await estimateTransport(rt.distanceKm, await userCurrency(req.user.id));
+    res.json({ distanceKm: rt.distanceKm, ...est, etaMinutes: rt.durationMin, routeSource: rt.source });
   }),
 );
 
@@ -3190,17 +3427,21 @@ router.get(
     if (o.acheteur_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Accès refusé.' });
     }
-    const pr = await pool.query('SELECT latitude, longitude FROM products WHERE id = $1', [o.product_id]);
+    const pr = await pool.query(
+      `SELECT COALESCE(p.latitude, u.localisation_lat) AS latitude, COALESCE(p.longitude, u.localisation_lng) AS longitude
+         FROM products p LEFT JOIN users u ON u.id = p.agriculteur_id WHERE p.id = $1`,
+      [o.product_id],
+    );
     const oLat = pr.rows[0]?.latitude, oLng = pr.rows[0]?.longitude;
     if (!validCoord(oLat, oLng)) return res.status(400).json({ message: 'Coordonnées manquantes.' });
     let dLat = o.destination_lat, dLng = o.destination_lng;
     if (!validCoord(dLat, dLng)) { dLat = req.query.destLat; dLng = req.query.destLng; }
     if (!validCoord(dLat, dLng)) return res.status(400).json({ message: 'Coordonnées manquantes.' });
-    const dist = haversineKm(Number(oLat), Number(oLng), Number(dLat), Number(dLng));
-    const est = await estimateTransport(dist);
+    const rt = await getRoadRoute(oLat, oLng, dLat, dLng);
+    const est = await estimateTransport(rt.distanceKm, await userCurrency(o.acheteur_id));
     const radius = await getCommissionPct('matching_rayon_km', 50);
     const drivers = await findNearbyDrivers(oLat, oLng, radius, [], 20);
-    res.json({ distanceKm: Math.round(dist * 10) / 10, ...est, radiusKm: radius, drivers });
+    res.json({ distanceKm: rt.distanceKm, ...est, etaMinutes: rt.durationMin, routeSource: rt.source, radiusKm: radius, drivers });
   }),
 );
 
@@ -3310,6 +3551,35 @@ router.post(
     );
     await offerMissionToNextDriver(req.params.id);
     res.json({ message: 'Mission refusée. Proposée au transporteur suivant.' });
+  }),
+);
+
+router.get(
+  '/transport/missions/:id/route',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const r = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    const m = r.rows[0];
+    if (!m) return res.status(404).json({ message: 'Mission introuvable.' });
+    if (m.acheteur_id !== req.user.id && m.transporteur_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Accès refusé.' });
+    }
+    const trip = await getRoadRoute(m.origine_lat, m.origine_lng, m.destination_lat, m.destination_lng);
+    let toPickup = null;
+    let remaining = null;
+    if (m.transporteur_id) {
+      const u = await pool.query('SELECT localisation_lat, localisation_lng FROM users WHERE id = $1', [m.transporteur_id]);
+      const pLat = m.position_actuelle_lat ?? u.rows[0]?.localisation_lat;
+      const pLng = m.position_actuelle_lng ?? u.rows[0]?.localisation_lng;
+      if (pLat != null && pLng != null) {
+        if (['Acceptée', 'En attente paiement transport', 'Transport payé'].includes(m.statut)) {
+          toPickup = await getRoadRoute(pLat, pLng, m.origine_lat, m.origine_lng);
+        } else if (['En route', 'Arrivée'].includes(m.statut)) {
+          remaining = await getRoadRoute(pLat, pLng, m.destination_lat, m.destination_lng);
+        }
+      }
+    }
+    res.json({ trip, toPickup, remaining });
   }),
 );
 
@@ -3674,7 +3944,11 @@ router.post(
     }
     // Origine = position du produit ; destination = adresse GPS de la commande (ou celle envoyée par l'app)
     if (!validCoord(origineLat, origineLng)) {
-      const pr = await pool.query('SELECT latitude, longitude FROM products WHERE id = $1', [o.product_id]);
+      const pr = await pool.query(
+        `SELECT COALESCE(p.latitude, u.localisation_lat) AS latitude, COALESCE(p.longitude, u.localisation_lng) AS longitude
+           FROM products p LEFT JOIN users u ON u.id = p.agriculteur_id WHERE p.id = $1`,
+        [o.product_id],
+      );
       origineLat = pr.rows[0]?.latitude; origineLng = pr.rows[0]?.longitude;
     }
     if (!validCoord(destinationLat, destinationLng)) {
@@ -3691,8 +3965,10 @@ router.post(
     );
     if (dup.rows[0]) return res.status(409).json({ message: 'Une mission existe déjà pour cette commande.' });
 
-    const dist = haversineKm(Number(origineLat), Number(origineLng), Number(destinationLat), Number(destinationLng));
-    const est = await estimateTransport(dist);
+    const rt = await getRoadRoute(origineLat, origineLng, destinationLat, destinationLng);
+    const dist = rt.distanceKm;
+    const est = await estimateTransport(dist, await userCurrency(o.acheteur_id));
+    est.etaMinutes = rt.durationMin;
     const radius = await getCommissionPct('matching_rayon_km', 50);
 
     // Choix du transporteur : explicite (liste "autour de moi"), automatique (le plus proche) ou ouvert à tous
@@ -4080,7 +4356,7 @@ router.post(
       {
         email: email || `${req.user.phone.replace('+','')}@difa.app`,
         amount: Math.round(Number(montantFcfa) * 100),
-        currency: 'XOF',
+        currency: await userCurrency(req.user.id),
         metadata: { purpose: metaPurpose, userId: req.user.id, orderId: orderId || null },
       },
       { headers: { Authorization: `Bearer ${secretKey}` } },
@@ -4357,7 +4633,7 @@ router.post(
         {
           tx_ref: txRef,
           amount: Number(montantFcfa),
-          currency: 'XOF',
+          currency: await userCurrency(req.user.id),
           redirect_url: process.env.FLUTTERWAVE_REDIRECT_URL || 'https://difabackenf.onrender.com/payments/flutterwave/return',
           customer: {
             email: email || `${String(req.user.phone).replace('+','')}@difa.app`,
@@ -4569,13 +4845,13 @@ const NOTIF_I18N = {
   test_push: {
     fr: { title: 'Test Difa', body: 'Si vous lisez ceci, les notifications push fonctionnent.' },
     en: { title: 'Difa Test', body: 'If you see this, push notifications work.' },
-    ee: { title: 'Difa Test', body: 'Push notifications work.' },
-    ha: { title: 'Difa Test', body: 'Push notifications work.' },
+    ee: { title: 'Difa kpɔɖeŋu', body: 'Ne èkpɔ sia la, push notificationwo dze egɔme nyuie.' },
+    ha: { title: 'Gwaji Difa', body: 'Idan kun ga wannan, sanarwar turawa tana aiki.' },
     es: { title: 'Prueba Difa', body: 'Si ves esto, las notificaciones funcionan.' },
     pt: { title: 'Teste Difa', body: 'Se estiver a ver isto, as notificações funcionam.' },
     ar: { title: 'اختبار ديفا', body: 'إذا رأيت هذا، فالإشعارات تعمل.' },
     zh: { title: 'Difa 测试', body: '如果您看到此消息，推送通知正常。' },
-    yo: { title: 'Difa Test', body: 'Push notifications work.' },
+    yo: { title: 'Ìdánwò Difa', body: 'Tí o bá rí èyí, àwọn ìfitónilétí ń ṣiṣẹ́.' },
     kbp: { title: 'Difa kpɔndʋ', body: 'Ñɛ ka naa se, push notification wɛ nyuie.' },
   },
 
