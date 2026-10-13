@@ -1,36 +1,64 @@
 services:
   - type: web
-    name: difa-backend
+    name: difabackenf          # même nom que ton service Render existant
     runtime: node
     buildCommand: npm install
     startCommand: node server.js
     plan: free
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 3000
+      # (ne pas définir PORT : Render l'injecte lui-même)
       - key: DATABASE_URL
         sync: false
       - key: DB_SSL
-        value: true
-      - key: REDIS_URL
+        value: "true"
+      - key: REDIS_URL          # optionnel (sinon mémoire du serveur)
         sync: false
       - key: JWT_ACCESS_SECRET
         generateValue: true
       - key: JWT_ACCESS_EXPIRES
         value: 15m
-      - key: AT_USERNAME
-        value: sandbox
-      - key: AT_API_KEY
+
+      # --- SMS (Vonage uniquement) ---
+      - key: VONAGE_API_KEY
         sync: false
-      - key: AT_SENDER_ID
+      - key: VONAGE_API_SECRET
+        sync: false
+      - key: VONAGE_FROM
         value: DIFA
+      # "true" = le code OTP est aussi renvoyé à l'app (tests sans SMS). Garder "false" en production.
+      - key: OTP_DEBUG
+        value: "false"
+
+      # --- Paiements ---
+      # "true" = paiements FICTIFS (tant que tu n'as pas de vraies clés). Passer à "false" en production réelle.
+      - key: MOBILE_MONEY_SANDBOX
+        value: "true"
       - key: PAYSTACK_SECRET_KEY
         sync: false
-      - key: GEMINI_API_KEY
+      - key: FLUTTERWAVE_SECRET_KEY
+        sync: false
+      - key: FLUTTERWAVE_SECRET_HASH
+        sync: false
+
+      # --- IA Gemini (plusieurs clés possibles, séparées par des virgules) ---
+      - key: GEMINI_API_KEYS
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-1.5-flash
-      - key: GOOGLE_MAPS_API_KEY
+        value: gemini-2.5-flash
+
+      # --- Fichiers (photos) ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # --- Notifications push Firebase ---
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
         sync: false
