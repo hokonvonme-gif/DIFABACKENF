@@ -182,7 +182,9 @@ function validateStartupConfig() {
 // BASE DE DONNEES (PostgreSQL — Supabase compatible)
 // ============================================================================
 
-const useSsl = !!process.env.DATABASE_URL || process.env.DB_SSL === 'true';
+const useSsl = process.env.DB_SSL != null
+  ? process.env.DB_SSL === 'true'
+  : !!process.env.DATABASE_URL;
 
 const pool = new Pool(
   process.env.DATABASE_URL
@@ -400,10 +402,26 @@ async function initDatabase() {
       type TEXT NOT NULL CHECK (type IN ('credit','debit')),
       montant_fcfa INTEGER NOT NULL,
       motif TEXT,
-      reference_id UUID,
+      reference_id TEXT,
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+
+  // Migration : anciennes bases où reference_id était UUID (casse retraits, Paystack, Flutterwave)
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF (SELECT data_type FROM information_schema.columns
+          WHERE table_name = 'wallet_transactions' AND column_name = 'reference_id') = 'uuid' THEN
+        ALTER TABLE wallet_transactions ALTER COLUMN reference_id TYPE TEXT USING reference_id::text;
+      END IF;
+    END $$;
+  `);
+  // Un crédit ne peut exister qu'une fois par référence (anti double-crédit webhook)
+  try {
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_wallet_credit_ref
+      ON wallet_transactions (reference_id) WHERE type = 'credit' AND reference_id IS NOT NULL`);
+  } catch (e) { console.warn('[DB] index crédit unique:', e.message); }
 
   // Module 3 — alertes agricoles / calendrier
   await pool.query(`
@@ -447,7 +465,11 @@ async function initDatabase() {
     INSERT INTO platform_config (cle, valeur) VALUES
       ('commission_vente_pct', '5'),
       ('commission_transport_pct', '10'),
-      ('matching_rayon_km', '50')
+      ('matching_rayon_km', '50'),
+      ('transport_base_fcfa', '500'),
+      ('transport_km_fcfa', '150'),
+      ('transport_speed_kmh', '30'),
+      ('offer_timeout_seconds', '60')
     ON CONFLICT (cle) DO NOTHING
   `);
 
@@ -467,7 +489,22 @@ async function initDatabase() {
     ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS distance_km NUMERIC(10,2);
     ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS eta_minutes INTEGER;
     ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS prix_transport_fcfa INTEGER;
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS offered_to UUID;
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS offered_at TIMESTAMPTZ;
+    ALTER TABLE transport_missions ADD COLUMN IF NOT EXISTS tried_ids JSONB DEFAULT '[]'::jsonb;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS disponible BOOLEAN DEFAULT false;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS position_updated_at TIMESTAMPTZ;
   `);
+
+  // Élargir les statuts mission (paiement transport avant départ)
+  try {
+    await pool.query(`ALTER TABLE transport_missions DROP CONSTRAINT IF EXISTS transport_missions_statut_check`);
+    await pool.query(`ALTER TABLE transport_missions ADD CONSTRAINT transport_missions_statut_check
+      CHECK (statut IN (
+        'En attente de transporteur','Acceptée','En attente paiement transport',
+        'Transport payé','En route','Arrivée','Livrée','Annulée','Refusée par acheteur'
+      ))`);
+  } catch (e) { console.warn('[DB] statut mission:', e.message); }
 
   // Enrichir transactions
   await pool.query(`
@@ -483,7 +520,24 @@ async function initDatabase() {
 // ============================================================================
 
 function generateOtpCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return crypto.randomInt(100000, 1000000).toString();
+}
+
+// Anti brute-force OTP : 5 essais max par numéro, puis le code est invalidé
+const otpAttempts = new Map(); // clé -> { count, resetAt }
+const OTP_MAX_ATTEMPTS = 5;
+function otpAttemptsExceeded(key) {
+  const e = otpAttempts.get(key);
+  if (!e || e.resetAt < Date.now()) return false;
+  return e.count >= OTP_MAX_ATTEMPTS;
+}
+function otpRegisterFailure(key) {
+  const e = otpAttempts.get(key);
+  if (!e || e.resetAt < Date.now()) {
+    otpAttempts.set(key, { count: 1, resetAt: Date.now() + OTP_TTL_SECONDS * 1000 });
+  } else {
+    e.count += 1;
+  }
 }
 
 /** Normalise le numéro pour éviter les mismatch +233 / 233 / espaces */
@@ -493,6 +547,7 @@ function normalizePhone(phone) {
 
 async function storeOtp(phone, code) {
   const key = normalizePhone(phone);
+  otpAttempts.delete(key);
   if (redisClient) {
     await redisClient.set(`otp:${key}`, code, 'EX', OTP_TTL_SECONDS);
   } else {
@@ -502,76 +557,83 @@ async function storeOtp(phone, code) {
 
 async function verifyAndConsumeOtp(phone, code) {
   const key = normalizePhone(phone);
+  if (otpAttemptsExceeded(key)) {
+    // trop d'essais : on détruit le code, il faut en redemander un
+    if (redisClient) await redisClient.del(`otp:${key}`);
+    else memoryOtpStore.delete(key);
+    return false;
+  }
   if (redisClient) {
     const stored = await redisClient.get(`otp:${key}`);
-    if (!stored || stored !== String(code).trim()) return false;
+    if (!stored || stored !== String(code).trim()) { otpRegisterFailure(key); return false; }
     await redisClient.del(`otp:${key}`);
+    otpAttempts.delete(key);
     return true;
   }
   const entry = memoryOtpStore.get(key);
-  if (!entry || entry.expiresAt < Date.now() || entry.code !== String(code).trim()) return false;
+  if (!entry || entry.expiresAt < Date.now() || entry.code !== String(code).trim()) {
+    otpRegisterFailure(key);
+    return false;
+  }
   memoryOtpStore.delete(key);
+  otpAttempts.delete(key);
   return true;
 }
 
-async function sendOtpSms(phone, code) {
-  // Toujours logger le code en premier (indispensable tant que les SMS ne sont pas fiables)
-  console.log(`[OTP] Code pour ${phone} : ${code}`);
+/** Langue demandée → langue utilisable pour SMS / messages (ee, kbp → fr ; ha, yo → en). */
+function baseLang(lang) {
+  const c = String(lang || 'fr').split(/[-_,;]/)[0].trim().toLowerCase();
+  if (['fr', 'en', 'es', 'pt', 'ar', 'zh'].includes(c)) return c;
+  if (c === 'ha' || c === 'yo') return 'en';
+  return 'fr';
+}
 
-  // Priorité 1 : Vonage (Nexmo)
+const OTP_SMS_TEXT = {
+  fr: (c) => `Votre code Difa est ${c}. Il expire dans 5 minutes.`,
+  en: (c) => `Your Difa code is ${c}. It expires in 5 minutes.`,
+  es: (c) => `Su código Difa es ${c}. Caduca en 5 minutos.`,
+  pt: (c) => `O seu código Difa é ${c}. Expira em 5 minutos.`,
+  ar: (c) => `رمز ديفا الخاص بك هو ${c}. ينتهي خلال 5 دقائق.`,
+  zh: (c) => `您的 Difa 验证码是 ${c}，5 分钟内有效。`,
+};
+
+async function sendOtpSms(phone, code, lang) {
+  // Le code n'est journalisé qu'hors production (les logs Render sont lisibles par l'équipe)
+  if (process.env.NODE_ENV !== 'production') console.log(`[OTP] Code pour ${phone} : ${code}`);
+
   const vonageKey = process.env.VONAGE_API_KEY;
   const vonageSecret = process.env.VONAGE_API_SECRET;
   const vonageFrom = process.env.VONAGE_FROM || 'DIFA';
-
-  if (vonageKey && vonageSecret) {
-    try {
-      const to = phone.replace(/^\+/, ''); // Vonage préfère sans le +
-      await axios.post(
-        'https://rest.nexmo.com/sms/json',
-        {
-          api_key: vonageKey,
-          api_secret: vonageSecret,
-          to,
-          from: vonageFrom,
-          text: `Votre code Difa est ${code}. Il expire dans 5 minutes.`,
-        },
-        { headers: { 'Content-Type': 'application/json' } },
-      );
+  if (!vonageKey || !vonageSecret) {
+    console.warn('[OTP] VONAGE_API_KEY / VONAGE_API_SECRET manquants : aucun SMS envoyé.');
+    return false;
+  }
+  const text = (OTP_SMS_TEXT[baseLang(lang)] || OTP_SMS_TEXT.fr)(code);
+  try {
+    const resp = await axios.post(
+      'https://rest.nexmo.com/sms/json',
+      {
+        api_key: vonageKey,
+        api_secret: vonageSecret,
+        to: String(phone).replace(/[^\d]/g, ''), // Vonage : chiffres uniquement, sans +
+        from: vonageFrom,
+        text,
+        type: /^[\x00-\x7F]*$/.test(text) ? 'text' : 'unicode',
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 },
+    );
+    // Vonage répond HTTP 200 même en cas d'échec : il faut lire messages[0].status ("0" = OK)
+    const m = resp.data?.messages?.[0];
+    if (m && String(m.status) === '0') {
       console.log(`[OTP] SMS Vonage envoyé à ${phone}`);
-      return;
-    } catch (err) {
-      console.error('[OTP] Échec envoi SMS Vonage :', err.response?.data || err.message);
+      return true;
     }
+    console.error('[OTP] Vonage a refusé le SMS :', m?.status, m?.['error-text'] || JSON.stringify(resp.data));
+    return false;
+  } catch (err) {
+    console.error('[OTP] Échec envoi SMS Vonage :', err.response?.data || err.message);
+    return false;
   }
-
-  // Priorité 2 : Africa's Talking (fallback)
-  const atKey = process.env.AT_API_KEY;
-  if (atKey) {
-    try {
-      await axios.post(
-        'https://api.africastalking.com/version1/messaging',
-        new URLSearchParams({
-          username: process.env.AT_USERNAME || 'sandbox',
-          to: phone,
-          message: `Votre code Difa est ${code}. Il expire dans 5 minutes.`,
-          from: process.env.AT_SENDER_ID || 'DIFA',
-        }),
-        {
-          headers: {
-            apiKey: atKey,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Accept: 'application/json',
-          },
-        },
-      );
-      console.log(`[OTP] SMS Africa's Talking envoyé à ${phone}`);
-      return;
-    } catch (err) {
-      console.error("[OTP] Échec envoi SMS Africa's Talking :", err.message);
-    }
-  }
-
-  console.warn(`[DEV] Aucun fournisseur SMS configuré — code OTP pour ${phone} : ${code}`);
 }
 
 // ============================================================================
@@ -680,6 +742,722 @@ app.use(
 );
 app.use(cors({ origin: '*' })); // à restreindre à ton domaine mobile une fois en prod
 
+// ============================================================================
+// TRADUCTION DES MESSAGES D'ERREUR / SUCCÈS DE L'API (selon l'en-tête Accept-Language)
+// L'app envoie la langue choisie ; ee et kbp reçoivent le français, ha et yo l'anglais.
+// ============================================================================
+const API_MESSAGES = {
+ "Accès refusé.": {
+  "en": "Access denied.",
+  "es": "Acceso denegado.",
+  "pt": "Acesso negado.",
+  "ar": "تم رفض الوصول.",
+  "zh": "访问被拒绝。"
+ },
+ "Identifiants incorrects.": {
+  "en": "Incorrect credentials.",
+  "es": "Credenciales incorrectas.",
+  "pt": "Credenciais incorretas.",
+  "ar": "بيانات الدخول غير صحيحة.",
+  "zh": "账号或密码错误。"
+ },
+ "Champs requis manquants.": {
+  "en": "Required fields are missing.",
+  "es": "Faltan campos obligatorios.",
+  "pt": "Campos obrigatórios em falta.",
+  "ar": "هناك حقول مطلوبة مفقودة.",
+  "zh": "缺少必填项。"
+ },
+ "Code OTP invalide ou expiré.": {
+  "en": "Invalid or expired OTP code.",
+  "es": "Código OTP inválido o caducado.",
+  "pt": "Código OTP inválido ou expirado.",
+  "ar": "رمز التحقق غير صالح أو منتهي.",
+  "zh": "验证码无效或已过期。"
+ },
+ "Un compte existe déjà avec ce numéro.": {
+  "en": "An account already exists with this number.",
+  "es": "Ya existe una cuenta con este número.",
+  "pt": "Já existe uma conta com este número.",
+  "ar": "يوجد حساب بهذا الرقم بالفعل.",
+  "zh": "该号码已注册账号。"
+ },
+ "Le mot de passe doit contenir au moins 6 caractères.": {
+  "en": "Password must be at least 6 characters.",
+  "es": "La contraseña debe tener al menos 6 caracteres.",
+  "pt": "A palavra-passe deve ter pelo menos 6 caracteres.",
+  "ar": "يجب أن تتكون كلمة المرور من 6 أحرف على الأقل.",
+  "zh": "密码至少需要 6 个字符。"
+ },
+ "Numéro non vérifié. Vérifiez votre OTP.": {
+  "en": "Number not verified. Please check your OTP.",
+  "es": "Número no verificado. Verifique su OTP.",
+  "pt": "Número não verificado. Verifique o seu OTP.",
+  "ar": "الرقم غير موثّق. تحقق من رمز OTP.",
+  "zh": "号码未验证，请检查验证码。"
+ },
+ "Compte désactivé. Contactez le support.": {
+  "en": "Account disabled. Contact support.",
+  "es": "Cuenta desactivada. Contacte con soporte.",
+  "pt": "Conta desativada. Contacte o suporte.",
+  "ar": "تم تعطيل الحساب. تواصل مع الدعم.",
+  "zh": "账号已停用，请联系客服。"
+ },
+ "Compte introuvable.": {
+  "en": "Account not found.",
+  "es": "Cuenta no encontrada.",
+  "pt": "Conta não encontrada.",
+  "ar": "الحساب غير موجود.",
+  "zh": "未找到账号。"
+ },
+ "Utilisateur introuvable.": {
+  "en": "User not found.",
+  "es": "Usuario no encontrado.",
+  "pt": "Utilizador não encontrado.",
+  "ar": "المستخدم غير موجود.",
+  "zh": "未找到用户。"
+ },
+ "5 tentatives échouées. Compte bloqué 15 minutes.": {
+  "en": "5 failed attempts. Account locked for 15 minutes.",
+  "es": "5 intentos fallidos. Cuenta bloqueada 15 minutos.",
+  "pt": "5 tentativas falhadas. Conta bloqueada 15 minutos.",
+  "ar": "5 محاولات فاشلة. تم قفل الحساب 15 دقيقة.",
+  "zh": "失败 5 次，账号锁定 15 分钟。"
+ },
+ "Session expirée. Reconnectez-vous.": {
+  "en": "Session expired. Please sign in again.",
+  "es": "Sesión caducada. Vuelva a iniciar sesión.",
+  "pt": "Sessão expirada. Inicie sessão novamente.",
+  "ar": "انتهت الجلسة. سجّل الدخول من جديد.",
+  "zh": "会话已过期，请重新登录。"
+ },
+ "Token manquant.": {
+  "en": "Missing token.",
+  "es": "Falta el token.",
+  "pt": "Token em falta.",
+  "ar": "الرمز مفقود.",
+  "zh": "缺少令牌。"
+ },
+ "Token invalide ou expiré.": {
+  "en": "Invalid or expired token.",
+  "es": "Token inválido o caducado.",
+  "pt": "Token inválido ou expirado.",
+  "ar": "الرمز غير صالح أو منتهي.",
+  "zh": "令牌无效或已过期。"
+ },
+ "Déconnexion réussie.": {
+  "en": "Signed out successfully.",
+  "es": "Sesión cerrada.",
+  "pt": "Sessão terminada.",
+  "ar": "تم تسجيل الخروج.",
+  "zh": "已退出登录。"
+ },
+ "Mot de passe réinitialisé. Reconnectez-vous.": {
+  "en": "Password reset. Please sign in again.",
+  "es": "Contraseña restablecida. Inicie sesión de nuevo.",
+  "pt": "Palavra-passe redefinida. Inicie sessão novamente.",
+  "ar": "تمت إعادة تعيين كلمة المرور. سجّل الدخول من جديد.",
+  "zh": "密码已重置，请重新登录。"
+ },
+ "Si ce numéro est enregistré, un code a été envoyé.": {
+  "en": "If this number is registered, a code has been sent.",
+  "es": "Si este número está registrado, se ha enviado un código.",
+  "pt": "Se este número estiver registado, foi enviado um código.",
+  "ar": "إذا كان هذا الرقم مسجلاً فقد تم إرسال رمز.",
+  "zh": "如果该号码已注册，验证码已发送。"
+ },
+ "Produit introuvable.": {
+  "en": "Product not found.",
+  "es": "Producto no encontrado.",
+  "pt": "Produto não encontrado.",
+  "ar": "المنتج غير موجود.",
+  "zh": "未找到产品。"
+ },
+ "Culture introuvable.": {
+  "en": "Crop not found.",
+  "es": "Cultivo no encontrado.",
+  "pt": "Cultura não encontrada.",
+  "ar": "المحصول غير موجود.",
+  "zh": "未找到作物。"
+ },
+ "Commande introuvable.": {
+  "en": "Order not found.",
+  "es": "Pedido no encontrado.",
+  "pt": "Encomenda não encontrada.",
+  "ar": "الطلب غير موجود.",
+  "zh": "未找到订单。"
+ },
+ "Mission introuvable.": {
+  "en": "Mission not found.",
+  "es": "Misión no encontrada.",
+  "pt": "Missão não encontrada.",
+  "ar": "المهمة غير موجودة.",
+  "zh": "未找到任务。"
+ },
+ "Demande introuvable.": {
+  "en": "Request not found.",
+  "es": "Solicitud no encontrada.",
+  "pt": "Pedido não encontrado.",
+  "ar": "الطلب غير موجود.",
+  "zh": "未找到请求。"
+ },
+ "Transaction introuvable.": {
+  "en": "Transaction not found.",
+  "es": "Transacción no encontrada.",
+  "pt": "Transação não encontrada.",
+  "ar": "المعاملة غير موجودة.",
+  "zh": "未找到交易。"
+ },
+ "Identifiant invalide.": {
+  "en": "Invalid identifier.",
+  "es": "Identificador no válido.",
+  "pt": "Identificador inválido.",
+  "ar": "معرّف غير صالح.",
+  "zh": "标识无效。"
+ },
+ "Ce produit ne vous appartient pas.": {
+  "en": "This product does not belong to you.",
+  "es": "Este producto no le pertenece.",
+  "pt": "Este produto não lhe pertence.",
+  "ar": "هذا المنتج ليس ملكك.",
+  "zh": "该产品不属于您。"
+ },
+ "Cette culture ne vous appartient pas.": {
+  "en": "This crop does not belong to you.",
+  "es": "Este cultivo no le pertenece.",
+  "pt": "Esta cultura não lhe pertence.",
+  "ar": "هذا المحصول ليس ملكك.",
+  "zh": "该作物不属于您。"
+ },
+ "Produit non disponible à la commande.": {
+  "en": "Product not available for order.",
+  "es": "Producto no disponible para pedido.",
+  "pt": "Produto indisponível para encomenda.",
+  "ar": "المنتج غير متاح للطلب.",
+  "zh": "该产品暂不可下单。"
+ },
+ "Quantité insuffisante en stock.": {
+  "en": "Insufficient stock.",
+  "es": "Existencias insuficientes.",
+  "pt": "Stock insuficiente.",
+  "ar": "الكمية المتوفرة غير كافية.",
+  "zh": "库存不足。"
+ },
+ "Vous ne pouvez pas commander votre propre produit.": {
+  "en": "You cannot order your own product.",
+  "es": "No puede pedir su propio producto.",
+  "pt": "Não pode encomendar o seu próprio produto.",
+  "ar": "لا يمكنك طلب منتجك الخاص.",
+  "zh": "您不能购买自己的产品。"
+ },
+ "productId et quantite > 0 requis.": {
+  "en": "productId and quantity > 0 are required.",
+  "es": "Se requieren productId y cantidad > 0.",
+  "pt": "productId e quantidade > 0 são obrigatórios.",
+  "ar": "مطلوب productId وكمية أكبر من 0.",
+  "zh": "需要 productId 和大于 0 的数量。"
+ },
+ "Commande annulée.": {
+  "en": "Order cancelled.",
+  "es": "Pedido cancelado.",
+  "pt": "Encomenda cancelada.",
+  "ar": "تم إلغاء الطلب.",
+  "zh": "订单已取消。"
+ },
+ "Cette commande ne peut plus être annulée.": {
+  "en": "This order can no longer be cancelled.",
+  "es": "Este pedido ya no se puede cancelar.",
+  "pt": "Esta encomenda já não pode ser cancelada.",
+  "ar": "لا يمكن إلغاء هذا الطلب بعد الآن.",
+  "zh": "该订单无法再取消。"
+ },
+ "Commande déjà payée : ouvrez un litige pour être remboursé.": {
+  "en": "Order already paid: open a dispute to get a refund.",
+  "es": "Pedido ya pagado: abra una disputa para obtener un reembolso.",
+  "pt": "Encomenda já paga: abra um litígio para ser reembolsado.",
+  "ar": "تم دفع الطلب: افتح نزاعاً لاسترداد المبلغ.",
+  "zh": "订单已支付：请发起纠纷以申请退款。"
+ },
+ "Commande déjà traitée.": {
+  "en": "Order already processed.",
+  "es": "Pedido ya procesado.",
+  "pt": "Encomenda já processada.",
+  "ar": "تمت معالجة الطلب مسبقاً.",
+  "zh": "订单已处理。"
+ },
+ "Cette commande ne peut plus être payée.": {
+  "en": "This order can no longer be paid.",
+  "es": "Este pedido ya no se puede pagar.",
+  "pt": "Esta encomenda já não pode ser paga.",
+  "ar": "لا يمكن دفع هذا الطلب بعد الآن.",
+  "zh": "该订单无法再支付。"
+ },
+ "La commande doit être payée avant de confirmer la livraison.": {
+  "en": "The order must be paid before confirming delivery.",
+  "es": "El pedido debe pagarse antes de confirmar la entrega.",
+  "pt": "A encomenda deve ser paga antes de confirmar a entrega.",
+  "ar": "يجب دفع الطلب قبل تأكيد التسليم.",
+  "zh": "确认收货前必须先支付订单。"
+ },
+ "La commande doit être payée avant le transport.": {
+  "en": "The order must be paid before transport.",
+  "es": "El pedido debe pagarse antes del transporte.",
+  "pt": "A encomenda deve ser paga antes do transporte.",
+  "ar": "يجب دفع الطلب قبل النقل.",
+  "zh": "运输前必须先支付订单。"
+ },
+ "Livraison confirmée. Agriculteur crédité.": {
+  "en": "Delivery confirmed. Farmer credited.",
+  "es": "Entrega confirmada. Agricultor acreditado.",
+  "pt": "Entrega confirmada. Agricultor creditado.",
+  "ar": "تم تأكيد التسليم وتحويل المبلغ للمزارع.",
+  "zh": "已确认收货，农户已入账。"
+ },
+ "Livraison déjà confirmée.": {
+  "en": "Delivery already confirmed.",
+  "es": "Entrega ya confirmada.",
+  "pt": "Entrega já confirmada.",
+  "ar": "تم تأكيد التسليم مسبقاً.",
+  "zh": "已确认过收货。"
+ },
+ "Solde insuffisant.": {
+  "en": "Insufficient balance.",
+  "es": "Saldo insuficiente.",
+  "pt": "Saldo insuficiente.",
+  "ar": "الرصيد غير كافٍ.",
+  "zh": "余额不足。"
+ },
+ "Solde portefeuille insuffisant.": {
+  "en": "Insufficient wallet balance.",
+  "es": "Saldo de la cartera insuficiente.",
+  "pt": "Saldo da carteira insuficiente.",
+  "ar": "رصيد المحفظة غير كافٍ.",
+  "zh": "钱包余额不足。"
+ },
+ "Solde portefeuille insuffisant pour payer le transport.": {
+  "en": "Insufficient wallet balance to pay for transport.",
+  "es": "Saldo insuficiente para pagar el transporte.",
+  "pt": "Saldo insuficiente para pagar o transporte.",
+  "ar": "رصيد المحفظة غير كافٍ لدفع النقل.",
+  "zh": "钱包余额不足以支付运费。"
+ },
+ "Paiement portefeuille réussi.": {
+  "en": "Wallet payment successful.",
+  "es": "Pago con cartera exitoso.",
+  "pt": "Pagamento com carteira concluído.",
+  "ar": "تم الدفع من المحفظة بنجاح.",
+  "zh": "钱包支付成功。"
+ },
+ "Paiement confirmé.": {
+  "en": "Payment confirmed.",
+  "es": "Pago confirmado.",
+  "pt": "Pagamento confirmado.",
+  "ar": "تم تأكيد الدفع.",
+  "zh": "支付已确认。"
+ },
+ "Montant invalide (min 100 FCFA).": {
+  "en": "Invalid amount (min 100 FCFA).",
+  "es": "Importe no válido (mín. 100 FCFA).",
+  "pt": "Montante inválido (mín. 100 FCFA).",
+  "ar": "مبلغ غير صالح (الحد الأدنى 100 فرنك).",
+  "zh": "金额无效（最低 100 FCFA）。"
+ },
+ "Montant invalide (100 à 2 000 000 FCFA).": {
+  "en": "Invalid amount (100 to 2,000,000 FCFA).",
+  "es": "Importe no válido (100 a 2.000.000 FCFA).",
+  "pt": "Montante inválido (100 a 2.000.000 FCFA).",
+  "ar": "مبلغ غير صالح (من 100 إلى 2,000,000 فرنك).",
+  "zh": "金额无效（100 至 2,000,000 FCFA）。"
+ },
+ "Montant minimum de retrait : 500 FCFA.": {
+  "en": "Minimum withdrawal: 500 FCFA.",
+  "es": "Retiro mínimo: 500 FCFA.",
+  "pt": "Levantamento mínimo: 500 FCFA.",
+  "ar": "الحد الأدنى للسحب: 500 فرنك.",
+  "zh": "最低提现金额：500 FCFA。"
+ },
+ "provider invalide.": {
+  "en": "Invalid provider.",
+  "es": "Proveedor no válido.",
+  "pt": "Fornecedor inválido.",
+  "ar": "مزوّد غير صالح.",
+  "zh": "服务商无效。"
+ },
+ "provider et destination (téléphone ou compte) requis.": {
+  "en": "Provider and destination (phone or account) are required.",
+  "es": "Se requieren proveedor y destino (teléfono o cuenta).",
+  "pt": "Fornecedor e destino (telefone ou conta) são obrigatórios.",
+  "ar": "مطلوب المزوّد والوجهة (هاتف أو حساب).",
+  "zh": "需要服务商和收款方（手机号或账号）。"
+ },
+ "Réservé aux administrateurs.": {
+  "en": "Reserved for administrators.",
+  "es": "Reservado a administradores.",
+  "pt": "Reservado a administradores.",
+  "ar": "للمسؤولين فقط.",
+  "zh": "仅限管理员。"
+ },
+ "Transaction déjà traitée.": {
+  "en": "Transaction already processed.",
+  "es": "Transacción ya procesada.",
+  "pt": "Transação já processada.",
+  "ar": "تمت معالجة المعاملة مسبقاً.",
+  "zh": "交易已处理。"
+ },
+ "Cette mission a déjà été prise.": {
+  "en": "This mission has already been taken.",
+  "es": "Esta misión ya fue tomada.",
+  "pt": "Esta missão já foi aceite.",
+  "ar": "تم أخذ هذه المهمة مسبقاً.",
+  "zh": "该任务已被接走。"
+ },
+ "Indiquez un prix de transport valide (minimum 100 FCFA).": {
+  "en": "Enter a valid transport price (minimum 100 FCFA).",
+  "es": "Indique un precio de transporte válido (mínimo 100 FCFA).",
+  "pt": "Indique um preço de transporte válido (mínimo 100 FCFA).",
+  "ar": "أدخل سعر نقل صالحاً (100 فرنك على الأقل).",
+  "zh": "请输入有效的运费（至少 100 FCFA）。"
+ },
+ "Prix de transport invalide.": {
+  "en": "Invalid transport price.",
+  "es": "Precio de transporte no válido.",
+  "pt": "Preço de transporte inválido.",
+  "ar": "سعر النقل غير صالح.",
+  "zh": "运费无效。"
+ },
+ "Cette mission n'attend pas un paiement transport.": {
+  "en": "This mission is not awaiting transport payment.",
+  "es": "Esta misión no espera pago de transporte.",
+  "pt": "Esta missão não aguarda pagamento de transporte.",
+  "ar": "هذه المهمة لا تنتظر دفع النقل.",
+  "zh": "该任务当前无需支付运费。"
+ },
+ "Transport payé. Le transporteur peut démarrer.": {
+  "en": "Transport paid. The transporter can start.",
+  "es": "Transporte pagado. El transportista puede comenzar.",
+  "pt": "Transporte pago. O transportador pode começar.",
+  "ar": "تم دفع النقل. يمكن للناقل البدء.",
+  "zh": "运费已支付，运输员可以出发。"
+ },
+ "Transport refusé. Organisez la récupération du produit par vos moyens.": {
+  "en": "Transport refused. Arrange pickup of the product yourself.",
+  "es": "Transporte rechazado. Organice usted mismo la recogida del producto.",
+  "pt": "Transporte recusado. Organize você mesmo a recolha do produto.",
+  "ar": "تم رفض النقل. رتّب استلام المنتج بنفسك.",
+  "zh": "已拒绝运输，请自行安排取货。"
+ },
+ "Impossible de refuser cette mission maintenant.": {
+  "en": "This mission cannot be refused right now.",
+  "es": "No se puede rechazar esta misión ahora.",
+  "pt": "Não é possível recusar esta missão agora.",
+  "ar": "لا يمكن رفض هذه المهمة الآن.",
+  "zh": "目前无法拒绝该任务。"
+ },
+ "Vous n'êtes pas le transporteur de cette mission.": {
+  "en": "You are not the transporter of this mission.",
+  "es": "No es el transportista de esta misión.",
+  "pt": "Não é o transportador desta missão.",
+  "ar": "لست ناقل هذه المهمة.",
+  "zh": "您不是该任务的运输员。"
+ },
+ "Le transporteur ne peut démarrer qu'après le paiement du transport par l'acheteur.": {
+  "en": "The transporter can only start after the buyer has paid for transport.",
+  "es": "El transportista solo puede comenzar tras el pago del transporte por el comprador.",
+  "pt": "O transportador só pode começar após o pagamento do transporte pelo comprador.",
+  "ar": "لا يمكن للناقل البدء إلا بعد دفع المشتري للنقل.",
+  "zh": "买家支付运费后，运输员才能出发。"
+ },
+ "Passez d'abord en « En route ».": {
+  "en": "Switch to \"On the way\" first.",
+  "es": "Pase primero a \"En camino\".",
+  "pt": "Passe primeiro a \"A caminho\".",
+  "ar": "انتقل أولاً إلى حالة «في الطريق».",
+  "zh": "请先切换为“运输中”。"
+ },
+ "Statut précédent invalide pour livrer.": {
+  "en": "Previous status is not valid for delivery.",
+  "es": "El estado anterior no es válido para entregar.",
+  "pt": "O estado anterior não é válido para entregar.",
+  "ar": "الحالة السابقة غير صالحة للتسليم.",
+  "zh": "当前状态无法确认送达。"
+ },
+ "Vous ne pouvez noter qu'après livraison.": {
+  "en": "You can only rate after delivery.",
+  "es": "Solo puede valorar tras la entrega.",
+  "pt": "Só pode avaliar após a entrega.",
+  "ar": "لا يمكنك التقييم إلا بعد التسليم.",
+  "zh": "送达后才能评分。"
+ },
+ "Note entre 1 et 5 requise.": {
+  "en": "A rating between 1 and 5 is required.",
+  "es": "Se requiere una nota entre 1 y 5.",
+  "pt": "É necessária uma nota entre 1 e 5.",
+  "ar": "التقييم مطلوب بين 1 و5.",
+  "zh": "评分需在 1 到 5 之间。"
+ },
+ "Merci pour votre évaluation.": {
+  "en": "Thank you for your rating.",
+  "es": "Gracias por su valoración.",
+  "pt": "Obrigado pela sua avaliação.",
+  "ar": "شكراً على تقييمك.",
+  "zh": "感谢您的评价。"
+ },
+ "Badge invalide. Valeurs : Certifié, Premium, Bio, Haute Qualité.": {
+  "en": "Invalid badge. Allowed: Certifié, Premium, Bio, Haute Qualité.",
+  "es": "Insignia no válida. Valores: Certifié, Premium, Bio, Haute Qualité.",
+  "pt": "Selo inválido. Valores: Certifié, Premium, Bio, Haute Qualité.",
+  "ar": "شارة غير صالحة. القيم: Certifié, Premium, Bio, Haute Qualité.",
+  "zh": "徽章无效。可选值：Certifié、Premium、Bio、Haute Qualité。"
+ },
+ "Le badge est requis.": {
+  "en": "A badge is required.",
+  "es": "Se requiere una insignia.",
+  "pt": "É necessário um selo.",
+  "ar": "الشارة مطلوبة.",
+  "zh": "必须选择徽章。"
+ },
+ "Cette demande a déjà été traitée.": {
+  "en": "This request has already been processed.",
+  "es": "Esta solicitud ya fue procesada.",
+  "pt": "Este pedido já foi processado.",
+  "ar": "تمت معالجة هذا الطلب مسبقاً.",
+  "zh": "该请求已处理。"
+ },
+ "Vous n'êtes pas assigné à cette inspection.": {
+  "en": "You are not assigned to this inspection.",
+  "es": "No está asignado a esta inspección.",
+  "pt": "Não está atribuído a esta inspeção.",
+  "ar": "لم يتم تعيينك لهذا الفحص.",
+  "zh": "您未被分配到该检查。"
+ },
+ "Message requis.": {
+  "en": "Message required.",
+  "es": "Mensaje requerido.",
+  "pt": "Mensagem obrigatória.",
+  "ar": "الرسالة مطلوبة.",
+  "zh": "需要输入消息。"
+ },
+ "L'assistant est temporairement indisponible. Réessayez plus tard.": {
+  "en": "The assistant is temporarily unavailable. Please try again later.",
+  "es": "El asistente no está disponible temporalmente. Inténtelo más tarde.",
+  "pt": "O assistente está temporariamente indisponível. Tente mais tarde.",
+  "ar": "المساعد غير متاح مؤقتاً. حاول لاحقاً.",
+  "zh": "助手暂时不可用，请稍后再试。"
+ },
+ "Ajouté aux favoris.": {
+  "en": "Added to favorites.",
+  "es": "Añadido a favoritos.",
+  "pt": "Adicionado aos favoritos.",
+  "ar": "تمت الإضافة إلى المفضلة.",
+  "zh": "已加入收藏。"
+ },
+ "Retiré des favoris.": {
+  "en": "Removed from favorites.",
+  "es": "Eliminado de favoritos.",
+  "pt": "Removido dos favoritos.",
+  "ar": "تمت الإزالة من المفضلة.",
+  "zh": "已取消收藏。"
+ },
+ "Notification marquée comme lue.": {
+  "en": "Notification marked as read.",
+  "es": "Notificación marcada como leída.",
+  "pt": "Notificação marcada como lida.",
+  "ar": "تم تعليم الإشعار كمقروء.",
+  "zh": "通知已标为已读。"
+ },
+ "Aucun fichier reçu (champ attendu : \"photo\").": {
+  "en": "No file received (expected field: \"photo\").",
+  "es": "No se recibió ningún archivo (campo esperado: \"photo\").",
+  "pt": "Nenhum ficheiro recebido (campo esperado: \"photo\").",
+  "ar": "لم يتم استلام أي ملف (الحقل المتوقع: \"photo\").",
+  "zh": "未收到文件（应为字段 “photo”）。"
+ },
+ "Échec de l'envoi de la photo. Réessayez.": {
+  "en": "Photo upload failed. Please try again.",
+  "es": "Error al subir la foto. Inténtelo de nuevo.",
+  "pt": "Falha ao enviar a foto. Tente novamente.",
+  "ar": "فشل رفع الصورة. حاول مرة أخرى.",
+  "zh": "照片上传失败，请重试。"
+ },
+ "Compte désactivé.": {
+  "en": "Account disabled.",
+  "es": "Cuenta desactivada.",
+  "pt": "Conta desativada.",
+  "ar": "تم تعطيل الحساب.",
+  "zh": "账号已停用。"
+ },
+ "Compte réactivé.": {
+  "en": "Account reactivated.",
+  "es": "Cuenta reactivada.",
+  "pt": "Conta reativada.",
+  "ar": "تمت إعادة تفعيل الحساب.",
+  "zh": "账号已重新启用。"
+ },
+ "Produit approuvé.": {
+  "en": "Product approved.",
+  "es": "Producto aprobado.",
+  "pt": "Produto aprovado.",
+  "ar": "تمت الموافقة على المنتج.",
+  "zh": "产品已通过。"
+ },
+ "Produit rejeté.": {
+  "en": "Product rejected.",
+  "es": "Producto rechazado.",
+  "pt": "Produto rejeitado.",
+  "ar": "تم رفض المنتج.",
+  "zh": "产品已被拒绝。"
+ },
+ "Litige mis à jour.": {
+  "en": "Dispute updated.",
+  "es": "Disputa actualizada.",
+  "pt": "Litígio atualizado.",
+  "ar": "تم تحديث النزاع.",
+  "zh": "纠纷已更新。"
+ },
+ "Alertes générées.": {
+  "en": "Alerts generated.",
+  "es": "Alertas generadas.",
+  "pt": "Alertas geradas.",
+  "ar": "تم إنشاء التنبيهات.",
+  "zh": "已生成提醒。"
+ },
+ "Téléphone et mot de passe requis.": {
+  "en": "Phone and password are required.",
+  "es": "Se requieren teléfono y contraseña.",
+  "pt": "Telefone e palavra-passe são obrigatórios.",
+  "ar": "الهاتف وكلمة المرور مطلوبان.",
+  "zh": "需要手机号和密码。"
+ },
+ "Téléphone et code OTP requis.": {
+  "en": "Phone and OTP code are required.",
+  "es": "Se requieren teléfono y código OTP.",
+  "pt": "Telefone e código OTP são obrigatórios.",
+  "ar": "الهاتف ورمز OTP مطلوبان.",
+  "zh": "需要手机号和验证码。"
+ },
+ "Rôle invalide.": {
+  "en": "Invalid role.",
+  "es": "Rol no válido.",
+  "pt": "Função inválida.",
+  "ar": "دور غير صالح.",
+  "zh": "角色无效。"
+ },
+ "Rôle non autorisé pour les commandes.": {
+  "en": "This role cannot place orders.",
+  "es": "Este rol no puede hacer pedidos.",
+  "pt": "Esta função não pode fazer encomendas.",
+  "ar": "هذا الدور لا يمكنه تقديم طلبات.",
+  "zh": "该角色不能下单。"
+ },
+ "Coordonnées manquantes.": {
+  "en": "Coordinates are missing.",
+  "es": "Faltan las coordenadas.",
+  "pt": "Coordenadas em falta.",
+  "ar": "الإحداثيات مفقودة.",
+  "zh": "缺少坐标。"
+ },
+ "orderId et coordonnées requis.": {
+  "en": "orderId and coordinates are required.",
+  "es": "Se requieren orderId y coordenadas.",
+  "pt": "orderId e coordenadas são obrigatórios.",
+  "ar": "مطلوب orderId والإحداثيات.",
+  "zh": "需要 orderId 和坐标。"
+ },
+ "orderId requis.": {
+  "en": "orderId is required.",
+  "es": "Se requiere orderId.",
+  "pt": "orderId é obrigatório.",
+  "ar": "orderId مطلوب.",
+  "zh": "需要 orderId。"
+ },
+ "productId requis.": {
+  "en": "productId is required.",
+  "es": "Se requiere productId.",
+  "pt": "productId é obrigatório.",
+  "ar": "productId مطلوب.",
+  "zh": "需要 productId。"
+ },
+ "refreshToken requis.": {
+  "en": "refreshToken is required.",
+  "es": "Se requiere refreshToken.",
+  "pt": "refreshToken é obrigatório.",
+  "ar": "refreshToken مطلوب.",
+  "zh": "需要 refreshToken。"
+ },
+ "transactionId invalide.": {
+  "en": "Invalid transactionId.",
+  "es": "transactionId no válido.",
+  "pt": "transactionId inválido.",
+  "ar": "transactionId غير صالح.",
+  "zh": "transactionId 无效。"
+ },
+ "Toutes les sessions ont été révoquées.": {
+  "en": "All sessions have been revoked.",
+  "es": "Todas las sesiones han sido revocadas.",
+  "pt": "Todas as sessões foram revogadas.",
+  "ar": "تم إلغاء جميع الجلسات.",
+  "zh": "所有会话已注销。"
+ }
+};
+
+Object.assign(API_MESSAGES, {
+  'Disponibilité mise à jour.': { en: 'Availability updated.', es: 'Disponibilidad actualizada.', pt: 'Disponibilidade atualizada.', ar: 'تم تحديث التوفر.', zh: '在线状态已更新。' },
+  'Position GPS valide requise.': { en: 'A valid GPS position is required.', es: 'Se requiere una posición GPS válida.', pt: 'É necessária uma posição GPS válida.', ar: 'مطلوب موقع GPS صالح.', zh: '需要有效的 GPS 位置。' },
+  'Cette mission est proposée à un autre transporteur.': { en: 'This mission is offered to another transporter.', es: 'Esta misión se ofrece a otro transportista.', pt: 'Esta missão foi proposta a outro transportador.', ar: 'هذه المهمة معروضة على ناقل آخر.', zh: '该任务已派给其他运输员。' },
+  'Une mission existe déjà pour cette commande.': { en: 'A mission already exists for this order.', es: 'Ya existe una misión para este pedido.', pt: 'Já existe uma missão para esta encomenda.', ar: 'توجد مهمة لهذا الطلب بالفعل.', zh: '该订单已有运输任务。' },
+  'Ce transporteur n\'est pas disponible.': { en: 'This transporter is not available.', es: 'Este transportista no está disponible.', pt: 'Este transportador não está disponível.', ar: 'هذا الناقل غير متاح.', zh: '该运输员当前不可用。' },
+  'Mission refusée. Proposée au transporteur suivant.': { en: 'Mission declined. Offered to the next transporter.', es: 'Misión rechazada. Ofrecida al siguiente transportista.', pt: 'Missão recusada. Proposta ao próximo transportador.', ar: 'تم رفض المهمة وعرضها على الناقل التالي.', zh: '已拒绝，任务将派给下一位运输员。' },
+  'Cette mission ne vous est pas proposée.': { en: 'This mission is not offered to you.', es: 'Esta misión no se le ofrece a usted.', pt: 'Esta missão não lhe foi proposta.', ar: 'هذه المهمة غير معروضة عليك.', zh: '该任务未派给您。' },
+});
+
+const API_MESSAGE_PATTERNS = [
+  {
+    re: /^Compte bloqué suite à trop de tentatives\. Réessayez dans (\d+) min\.$/,
+    t: {
+      en: (m) => `Account locked after too many attempts. Try again in ${m[1]} min.`,
+      es: (m) => `Cuenta bloqueada por demasiados intentos. Inténtelo en ${m[1]} min.`,
+      pt: (m) => `Conta bloqueada por demasiadas tentativas. Tente em ${m[1]} min.`,
+      ar: (m) => `تم قفل الحساب بعد محاولات كثيرة. حاول بعد ${m[1]} دقيقة.`,
+      zh: (m) => `尝试次数过多，账号已锁定，请 ${m[1]} 分钟后再试。`,
+    },
+  },
+  {
+    re: /^Accès refusé\. Rôle\(s\) requis : (.+)$/,
+    t: {
+      en: (m) => `Access denied. Required role(s): ${m[1]}`,
+      es: (m) => `Acceso denegado. Rol(es) requerido(s): ${m[1]}`,
+      pt: (m) => `Acesso negado. Função(ões) necessária(s): ${m[1]}`,
+      ar: (m) => `تم رفض الوصول. الدور المطلوب: ${m[1]}`,
+      zh: (m) => `访问被拒绝。所需角色：${m[1]}`,
+    },
+  },
+];
+
+function translateApiMessage(msg, lang) {
+  if (lang === 'fr') return msg;
+  const hit = API_MESSAGES[msg];
+  if (hit && hit[lang]) return hit[lang];
+  for (const p of API_MESSAGE_PATTERNS) {
+    const m = p.re.exec(msg);
+    if (m && p.t[lang]) return p.t[lang](m);
+  }
+  return msg;
+}
+
+app.use((req, res, next) => {
+  const lang = baseLang(req.headers['x-app-language'] || req.headers['accept-language']);
+  if (lang === 'fr') return next();
+  const original = res.json.bind(res);
+  res.json = (body) => {
+    if (body && typeof body === 'object' && typeof body.message === 'string') {
+      body = { ...body, message: translateApiMessage(body.message, lang) };
+    }
+    return original(body);
+  };
+  next();
+});
+
+
 // Limite globale : 100 requêtes / 15 min / IP — protège contre les abus génériques
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -702,6 +1480,50 @@ const authLimiter = rateLimit({
 const router = express.Router();
 app.use('/api/v1', router);
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+for (const p of ['id', 'productId', 'cultureId']) {
+  router.param(p, (req, res, next, val) => {
+    if (!UUID_RE.test(String(val))) {
+      return res.status(400).json({ message: 'Identifiant invalide.' });
+    }
+    next();
+  });
+}
+
+/** Exécute fn(client) dans une transaction SQL (COMMIT / ROLLBACK automatiques). */
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const out = await fn(client);
+    await client.query('COMMIT');
+    return out;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/** Vérifie qu'une commande est payable par cet utilisateur et renvoie le VRAI montant. */
+async function resolveOrderPayable(orderId, userId) {
+  if (!UUID_RE.test(String(orderId))) return { status: 400, error: 'orderId invalide.' };
+  const r = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+  const o = r.rows[0];
+  if (!o) return { status: 404, error: 'Commande introuvable.' };
+  if (o.acheteur_id !== userId) return { status: 403, error: 'Accès refusé.' };
+  if (o.statut !== 'en_attente_paiement') {
+    return { status: 400, error: 'Cette commande ne peut plus être payée.' };
+  }
+  return { amount: Number(o.montant_total_fcfa) };
+}
+
+const SANDBOX_PAYMENTS = process.env.MOBILE_MONEY_SANDBOX === 'true';
+if (SANDBOX_PAYMENTS) {
+  console.warn('[Paiement] MOBILE_MONEY_SANDBOX=true : paiements FICTIFS acceptés (ne jamais utiliser avec de vrais clients).');
+}
+
 // ============================================================================
 // MODULE 1 — AUTHENTIFICATION & SECURITE
 // ============================================================================
@@ -710,7 +1532,7 @@ router.post(
   '/auth/register',
   authLimiter,
   asyncHandler(async (req, res) => {
-    const { fullName, phone, password, role, region, email } = req.body;
+    const { fullName, phone, password, role, region, email, language } = req.body;
 
     if (!fullName || !phone || !password || !role) {
       return res.status(400).json({ message: 'Champs requis manquants.' });
@@ -757,9 +1579,10 @@ router.post(
     const id = crypto.randomUUID();
 
     await pool.query(
-      `INSERT INTO users (id, full_name, phone, email, password_hash, role, region, phone_verified)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
-      [id, fullName, phone, email || null, passwordHash, role, region || null],
+      `INSERT INTO users (id, full_name, phone, email, password_hash, role, region, phone_verified, preferred_language)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8)`,
+      [id, fullName, phone, email || null, passwordHash, role, region || null,
+        String(language || 'fr').split('-')[0].toLowerCase().slice(0, 8)],
     );
 
     if (role === 'admin') {
@@ -775,7 +1598,7 @@ router.post(
 
     const code = generateOtpCode();
     await storeOtp(phone, code);
-    await sendOtpSms(phone, code);
+    const smsSent = await sendOtpSms(phone, code, language || req.headers['accept-language']);
 
     // Auto-remplissage app : renvoyer le code sauf si OTP_HIDE_CODE=true
     const payload = {
@@ -783,7 +1606,12 @@ router.post(
       message: 'Code de vérification envoyé par SMS.',
       debugOtp: String(code),
     };
-    if (process.env.OTP_HIDE_CODE === 'true') {
+    // Le code n'est renvoyé à l'app que si OTP_DEBUG=true, ou en développement quand le SMS n'est pas parti
+    const exposeOtp =
+      process.env.OTP_HIDE_CODE !== 'true' &&
+      (process.env.OTP_DEBUG === 'true' ||
+        (process.env.NODE_ENV !== 'production' && !smsSent));
+    if (!exposeOtp) {
       delete payload.debugOtp;
     }
     console.log(`[OTP] Réponse register debugOtp=${payload.debugOtp || '(caché)'}`);
@@ -929,12 +1757,12 @@ router.post(
   authLimiter,
   asyncHandler(async (req, res) => {
     const { phone } = req.body;
-    const result = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    const result = await pool.query('SELECT id, preferred_language FROM users WHERE phone = $1', [phone]);
     // Anti-énumération : toujours le même message, que le compte existe ou non
     if (result.rows.length > 0) {
       const code = generateOtpCode();
       await storeOtp(phone, code);
-      await sendOtpSms(phone, code);
+      await sendOtpSms(phone, code, req.body.language || result.rows[0].preferred_language);
     }
     res.json({ message: 'Si ce numéro est enregistré, un code a été envoyé.' });
   }),
@@ -1567,6 +2395,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const { badge, commentaire } = req.body;
     if (!badge) return res.status(400).json({ message: 'Le badge est requis.' });
+    if (!['Certifié', 'Premium', 'Bio', 'Haute Qualité'].includes(badge)) {
+      return res.status(400).json({ message: 'Badge invalide. Valeurs : Certifié, Premium, Bio, Haute Qualité.' });
+    }
 
     const existing = await pool.query('SELECT * FROM certifications WHERE id = $1', [
       req.params.id,
@@ -1696,11 +2527,11 @@ router.post(
     const prod = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
     if (!prod.rows[0]) return res.status(404).json({ message: 'Produit introuvable.' });
     const p = prod.rows[0];
-    if (p.statut !== 'Publié' && !p.badge) {
-      // Autoriser aussi si badge déjà attribué même si statut encore en attente selon workflow
-      if (p.statut === 'Rejeté' || p.statut === 'Épuisé') {
-        return res.status(400).json({ message: 'Produit non disponible à la commande.' });
-      }
+    if (p.statut !== 'Publié') {
+      return res.status(400).json({ message: 'Produit non disponible à la commande.' });
+    }
+    if (p.agriculteur_id === req.user.id) {
+      return res.status(400).json({ message: 'Vous ne pouvez pas commander votre propre produit.' });
     }
     if (Number(p.quantite) < Number(quantite)) {
       return res.status(400).json({ message: 'Quantité insuffisante en stock.' });
@@ -1710,6 +2541,19 @@ router.post(
     const pct = await getCommissionPct('commission_vente_pct', 5);
     const commission = Math.round(montant * (pct / 100));
     const id = crypto.randomUUID();
+    // Réservation atomique du stock (évite la survente)
+    const reserve = await pool.query(
+      `UPDATE products
+         SET quantite = quantite - $1,
+             statut = CASE WHEN quantite - $1 <= 0 THEN 'Épuisé' ELSE statut END,
+             updated_at = now()
+       WHERE id = $2 AND statut = 'Publié' AND quantite >= $1
+       RETURNING id`,
+      [quantite, productId],
+    );
+    if (reserve.rowCount === 0) {
+      return res.status(400).json({ message: 'Quantité insuffisante en stock.' });
+    }
     await pool.query(
       `INSERT INTO orders (
         id, acheteur_id, product_id, agriculteur_id, quantite, prix_unitaire_fcfa,
@@ -1799,12 +2643,26 @@ router.patch(
     if (o.acheteur_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Accès refusé.' });
     }
-    if (!['en_attente_paiement', 'paye'].includes(o.statut)) {
+    if (o.statut === 'paye') {
+      return res.status(400).json({
+        message: 'Commande déjà payée : ouvrez un litige pour être remboursé.',
+      });
+    }
+    const cancelled = await pool.query(
+      `UPDATE orders SET statut = 'annule', updated_at = now()
+       WHERE id = $1 AND statut = 'en_attente_paiement' RETURNING product_id, quantite`,
+      [req.params.id],
+    );
+    if (cancelled.rowCount === 0) {
       return res.status(400).json({ message: 'Cette commande ne peut plus être annulée.' });
     }
     await pool.query(
-      `UPDATE orders SET statut = 'annule', updated_at = now() WHERE id = $1`,
-      [req.params.id],
+      `UPDATE products
+         SET quantite = quantite + $1,
+             statut = CASE WHEN statut = 'Épuisé' THEN 'Publié' ELSE statut END,
+             updated_at = now()
+       WHERE id = $2`,
+      [cancelled.rows[0].quantite, cancelled.rows[0].product_id],
     );
     await notifyUser(o.agriculteur_id, 'commande_annulee', { name: o.id }, { orderId: o.id });
     res.json({ message: 'Commande annulée.' });
@@ -1821,22 +2679,39 @@ router.patch(
     if (!result.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
     const o = result.rows[0];
     if (o.acheteur_id !== req.user.id) return res.status(403).json({ message: 'Accès refusé.' });
-    await pool.query(
-      `UPDATE orders SET statut = 'livre', updated_at = now() WHERE id = $1`,
-      [req.params.id],
-    );
-    // Créditer le portefeuille agriculteur (montant - commission)
+    if (!['paye', 'confirme', 'en_livraison'].includes(o.statut)) {
+      return res.status(400).json({
+        message:
+          o.statut === 'livre'
+            ? 'Livraison déjà confirmée.'
+            : "La commande doit être payée avant de confirmer la livraison.",
+      });
+    }
+    // Transition atomique + crédit unique (impossible de créditer deux fois)
     const net = o.montant_total_fcfa - (o.commission_fcfa || 0);
-    await ensureWallet(o.agriculteur_id);
-    await pool.query(
-      `UPDATE wallets SET solde_fcfa = solde_fcfa + $1, updated_at = now() WHERE user_id = $2`,
-      [net, o.agriculteur_id],
-    );
-    await pool.query(
-      `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
-       VALUES ($1,$2,'credit',$3,'Vente produit',$4)`,
-      [crypto.randomUUID(), o.agriculteur_id, net, o.id],
-    );
+    const done = await withTransaction(async (c) => {
+      const upd = await c.query(
+        `UPDATE orders SET statut = 'livre', updated_at = now()
+         WHERE id = $1 AND statut IN ('paye','confirme','en_livraison') RETURNING id`,
+        [req.params.id],
+      );
+      if (upd.rowCount === 0) return false;
+      await c.query(
+        `INSERT INTO wallets (user_id, solde_fcfa) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING`,
+        [o.agriculteur_id],
+      );
+      await c.query(
+        `UPDATE wallets SET solde_fcfa = solde_fcfa + $1, updated_at = now() WHERE user_id = $2`,
+        [net, o.agriculteur_id],
+      );
+      await c.query(
+        `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+         VALUES ($1,$2,'credit',$3,'Vente produit',$4)`,
+        [crypto.randomUUID(), o.agriculteur_id, net, o.id],
+      );
+      return true;
+    });
+    if (!done) return res.status(400).json({ message: 'Livraison déjà confirmée.' });
     await notifyUser(o.agriculteur_id, 'commande_livree', { amount: String(net) }, { orderId: o.id });
     res.json({ message: 'Livraison confirmée. Agriculteur crédité.' });
   }),
@@ -1903,6 +2778,33 @@ async function ensureWallet(userId) {
     [userId],
   );
 }
+
+/** Crédit portefeuille unique par référence (évite double crédit webhook) */
+async function creditWalletOnce(userId, amount, motif, referenceId) {
+  const amt = Math.round(Number(amount) || 0);
+  if (!userId || amt <= 0) return false;
+  return withTransaction(async (c) => {
+    await c.query(
+      `INSERT INTO wallets (user_id, solde_fcfa) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
+    // L'insertion échoue silencieusement si cette référence a déjà été créditée
+    const ins = await c.query(
+      `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+       SELECT $1,$2,'credit',$3,$4,$5
+       WHERE NOT EXISTS (SELECT 1 FROM wallet_transactions WHERE reference_id = $5 AND type = 'credit')
+       RETURNING id`,
+      [crypto.randomUUID(), userId, amt, motif || 'Recharge portefeuille', String(referenceId)],
+    );
+    if (ins.rowCount === 0) return false;
+    await c.query(
+      `UPDATE wallets SET solde_fcfa = solde_fcfa + $1, updated_at = now() WHERE user_id = $2`,
+      [amt, userId],
+    );
+    return true;
+  });
+}
+
 
 router.get(
   '/wallet',
@@ -2131,6 +3033,213 @@ function serializeMission(row) {
   };
 }
 
+
+// ---------- Recherche de transporteurs façon Gozem ----------
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+const validCoord = (lat, lng) =>
+  Number.isFinite(Number(lat)) && Number.isFinite(Number(lng)) &&
+  lat !== null && lng !== null && lat !== '' && lng !== '' &&
+  Math.abs(Number(lat)) <= 90 && Math.abs(Number(lng)) <= 180;
+
+async function estimateTransport(distKm) {
+  const base = await getCommissionPct('transport_base_fcfa', 500);
+  const perKm = await getCommissionPct('transport_km_fcfa', 150);
+  const speed = await getCommissionPct('transport_speed_kmh', 30);
+  return {
+    prixFcfa: Math.max(base, Math.round(distKm * perKm)),
+    etaMinutes: Math.max(1, Math.round((distKm / speed) * 60)),
+  };
+}
+
+const ACTIVE_MISSION_STATUTS = [
+  'Acceptée', 'En attente paiement transport', 'Transport payé', 'En route', 'Arrivée',
+];
+
+/** Transporteurs en ligne, position récente (< 10 min), sans mission en cours, triés par distance. */
+async function findNearbyDrivers(lat, lng, radiusKm, excludeIds = [], limit = 20) {
+  const r = await pool.query(
+    `SELECT u.id, u.full_name, u.note_moyenne, u.vehicule_type, u.localisation_lat, u.localisation_lng
+       FROM users u
+      WHERE u.role = 'transporteur' AND u.is_active = true AND u.disponible = true
+        AND u.localisation_lat IS NOT NULL AND u.localisation_lng IS NOT NULL
+        AND u.position_updated_at > now() - interval '10 minutes'
+        AND NOT (u.id = ANY($1::uuid[]))
+        AND NOT EXISTS (
+          SELECT 1 FROM transport_missions m
+           WHERE m.transporteur_id = u.id AND m.statut = ANY($2::text[])
+        )`,
+    [excludeIds, ACTIVE_MISSION_STATUTS],
+  );
+  const speed = await getCommissionPct('transport_speed_kmh', 30);
+  return r.rows
+    .map((u) => {
+      const d = haversineKm(Number(lat), Number(lng), Number(u.localisation_lat), Number(u.localisation_lng));
+      return {
+        id: u.id,
+        // vie privée : prénom + initiale uniquement, pas de téléphone
+        name: String(u.full_name || '').split(/\s+/).map((p, i) => (i === 0 ? p : p.charAt(0) + '.')).join(' '),
+        noteMoyenne: u.note_moyenne != null ? Number(u.note_moyenne) : 5,
+        vehiculeType: u.vehicule_type || null,
+        distanceKm: Math.round(d * 10) / 10,
+        etaMinutes: Math.max(1, Math.round((d / speed) * 60)),
+        lat: Number(u.localisation_lat),
+        lng: Number(u.localisation_lng),
+      };
+    })
+    .filter((u) => u.distanceKm <= radiusKm)
+    .sort((a, b) => a.distanceKm - b.distanceKm || b.noteMoyenne - a.noteMoyenne)
+    .slice(0, limit);
+}
+
+/** Le transporteur se met en ligne / hors ligne et envoie sa position. */
+router.patch(
+  '/transport/availability',
+  requireAuth,
+  requireRole('transporteur'),
+  asyncHandler(async (req, res) => {
+    const { disponible, lat, lng } = req.body;
+    const hasPos = validCoord(lat, lng);
+    if (disponible === true && !hasPos) {
+      return res.status(400).json({ message: 'Position GPS valide requise.' });
+    }
+    await pool.query(
+      `UPDATE users SET
+         disponible = $1,
+         localisation_lat = CASE WHEN $4::boolean THEN $2::numeric ELSE localisation_lat END,
+         localisation_lng = CASE WHEN $4::boolean THEN $3::numeric ELSE localisation_lng END,
+         position_updated_at = CASE WHEN $4::boolean THEN now() ELSE position_updated_at END,
+         updated_at = now()
+       WHERE id = $5`,
+      [disponible === true, hasPos ? lat : null, hasPos ? lng : null, hasPos, req.user.id],
+    );
+    res.json({ message: 'Disponibilité mise à jour.', disponible: disponible === true });
+  }),
+);
+
+/** Battement de position (toutes les ~30 s tant que le transporteur est en ligne). */
+router.post(
+  '/transport/location',
+  requireAuth,
+  requireRole('transporteur'),
+  asyncHandler(async (req, res) => {
+    const { lat, lng } = req.body;
+    if (!validCoord(lat, lng)) return res.status(400).json({ message: 'Position GPS valide requise.' });
+    await pool.query(
+      `UPDATE users SET localisation_lat = $1, localisation_lng = $2, position_updated_at = now() WHERE id = $3`,
+      [lat, lng, req.user.id],
+    );
+    res.json({ ok: true });
+  }),
+);
+
+router.get(
+  '/transport/me',
+  requireAuth,
+  requireRole('transporteur'),
+  asyncHandler(async (req, res) => {
+    const r = await pool.query('SELECT disponible FROM users WHERE id = $1', [req.user.id]);
+    res.json({ disponible: r.rows[0]?.disponible === true });
+  }),
+);
+
+/** Estimation distance / prix / durée avant de commander un transport. */
+router.get(
+  '/transport/estimate',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { originLat, originLng, destinationLat, destinationLng } = req.query;
+    if (!validCoord(originLat, originLng) || !validCoord(destinationLat, destinationLng)) {
+      return res.status(400).json({ message: 'Coordonnées manquantes.' });
+    }
+    const dist = haversineKm(Number(originLat), Number(originLng), Number(destinationLat), Number(destinationLng));
+    const est = await estimateTransport(dist);
+    res.json({ distanceKm: Math.round(dist * 10) / 10, ...est });
+  }),
+);
+
+/** Transporteurs disponibles autour d'un point (le plus proche en premier). */
+router.get(
+  '/transport/drivers/nearby',
+  requireAuth,
+  requireRole('acheteur', 'restaurant', 'agriculteur', 'admin'),
+  asyncHandler(async (req, res) => {
+    const { lat, lng } = req.query;
+    if (!validCoord(lat, lng)) return res.status(400).json({ message: 'Coordonnées manquantes.' });
+    const radius = Math.min(200, Number(req.query.radiusKm) || (await getCommissionPct('matching_rayon_km', 50)));
+    const drivers = await findNearbyDrivers(lat, lng, radius, [], 20);
+    res.json({ radiusKm: radius, drivers });
+  }),
+);
+
+/** Écran "Trouver un transporteur" : estimation + transporteurs disponibles autour du point de départ. */
+router.get(
+  '/transport/orders/:id/options',
+  requireAuth,
+  requireRole('acheteur', 'restaurant', 'admin'),
+  asyncHandler(async (req, res) => {
+    const ord = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    const o = ord.rows[0];
+    if (!o) return res.status(404).json({ message: 'Commande introuvable.' });
+    if (o.acheteur_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Accès refusé.' });
+    }
+    const pr = await pool.query('SELECT latitude, longitude FROM products WHERE id = $1', [o.product_id]);
+    const oLat = pr.rows[0]?.latitude, oLng = pr.rows[0]?.longitude;
+    if (!validCoord(oLat, oLng)) return res.status(400).json({ message: 'Coordonnées manquantes.' });
+    let dLat = o.destination_lat, dLng = o.destination_lng;
+    if (!validCoord(dLat, dLng)) { dLat = req.query.destLat; dLng = req.query.destLng; }
+    if (!validCoord(dLat, dLng)) return res.status(400).json({ message: 'Coordonnées manquantes.' });
+    const dist = haversineKm(Number(oLat), Number(oLng), Number(dLat), Number(dLng));
+    const est = await estimateTransport(dist);
+    const radius = await getCommissionPct('matching_rayon_km', 50);
+    const drivers = await findNearbyDrivers(oLat, oLng, radius, [], 20);
+    res.json({ distanceKm: Math.round(dist * 10) / 10, ...est, radiusKm: radius, drivers });
+  }),
+);
+
+/** Propose la mission au transporteur le plus proche non encore sollicité (null = ouverte à tous). */
+async function offerMissionToNextDriver(missionId) {
+  const r = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [missionId]);
+  const m = r.rows[0];
+  if (!m || m.statut !== 'En attente de transporteur') return null;
+  const tried = Array.isArray(m.tried_ids) ? m.tried_ids : [];
+  const radius = await getCommissionPct('matching_rayon_km', 50);
+  const next = (await findNearbyDrivers(m.origine_lat, m.origine_lng, radius, tried, 1))[0];
+  if (!next) {
+    await pool.query(`UPDATE transport_missions SET offered_to = NULL, offered_at = NULL WHERE id = $1`, [missionId]);
+    return null;
+  }
+  await pool.query(`UPDATE transport_missions SET offered_to = $1, offered_at = now() WHERE id = $2`, [next.id, missionId]);
+  await notifyUser(next.id, 'nouvelle_mission', { km: String(Math.round(Number(m.distance_km) || next.distanceKm)) }, { missionId });
+  return next;
+}
+
+/** Les offres sans réponse dans le délai passent automatiquement au transporteur suivant. */
+async function redispatchExpiredOffers() {
+  const timeout = await getCommissionPct('offer_timeout_seconds', 60);
+  const r = await pool.query(
+    `SELECT id, offered_to FROM transport_missions
+      WHERE statut = 'En attente de transporteur' AND offered_to IS NOT NULL
+        AND offered_at < now() - make_interval(secs => $1)`,
+    [timeout],
+  );
+  for (const m of r.rows) {
+    await pool.query(
+      `UPDATE transport_missions SET tried_ids = COALESCE(tried_ids,'[]'::jsonb) || to_jsonb($1::text) WHERE id = $2`,
+      [m.offered_to, m.id],
+    );
+    await offerMissionToNextDriver(m.id);
+  }
+}
+setInterval(() => redispatchExpiredOffers().catch((e) => console.error('[Dispatch]', e.message)), 15000).unref();
+
 router.post(
   '/transport/missions',
   requireAuth,
@@ -2156,10 +3265,51 @@ router.get(
   requireAuth,
   requireRole('transporteur'),
   asyncHandler(async (req, res) => {
+    const timeout = await getCommissionPct('offer_timeout_seconds', 60);
+    const me = await pool.query('SELECT localisation_lat, localisation_lng FROM users WHERE id = $1', [req.user.id]);
     const result = await pool.query(
-      `SELECT * FROM transport_missions WHERE statut = 'En attente de transporteur' ORDER BY created_at ASC`,
+      `SELECT * FROM transport_missions
+        WHERE statut = 'En attente de transporteur'
+          AND (offered_to IS NULL OR offered_to = $1 OR offered_at < now() - make_interval(secs => $2))
+          AND NOT (COALESCE(tried_ids,'[]'::jsonb) ? $1::text)
+        ORDER BY created_at ASC`,
+      [req.user.id, timeout],
     );
-    res.json(result.rows.map(serializeMission));
+    const lat = me.rows[0]?.localisation_lat, lng = me.rows[0]?.localisation_lng;
+    const out = result.rows.map((row) => {
+      const mission = serializeMission(row);
+      mission.offeredToMe = row.offered_to === req.user.id;
+      mission.distancePickupKm = lat != null
+        ? Math.round(haversineKm(Number(lat), Number(lng), Number(row.origine_lat), Number(row.origine_lng)) * 10) / 10
+        : null;
+      return mission;
+    });
+    // Offres qui me sont destinées d'abord, puis les plus proches
+    out.sort((a, b) =>
+      (b.offeredToMe ? 1 : 0) - (a.offeredToMe ? 1 : 0) ||
+      (a.distancePickupKm ?? 1e9) - (b.distancePickupKm ?? 1e9));
+    res.json(out);
+  }),
+);
+
+/** Le transporteur refuse l'offre : on la propose au suivant. */
+router.post(
+  '/transport/missions/:id/decline',
+  requireAuth,
+  requireRole('transporteur'),
+  asyncHandler(async (req, res) => {
+    const r = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    const m = r.rows[0];
+    if (!m) return res.status(404).json({ message: 'Mission introuvable.' });
+    if (m.statut !== 'En attente de transporteur' || m.offered_to !== req.user.id) {
+      return res.status(400).json({ message: 'Cette mission ne vous est pas proposée.' });
+    }
+    await pool.query(
+      `UPDATE transport_missions SET tried_ids = COALESCE(tried_ids,'[]'::jsonb) || to_jsonb($1::text) WHERE id = $2`,
+      [req.user.id, req.params.id],
+    );
+    await offerMissionToNextDriver(req.params.id);
+    res.json({ message: 'Mission refusée. Proposée au transporteur suivant.' });
   }),
 );
 
@@ -2188,22 +3338,152 @@ router.post(
     if (existing.rows[0].statut !== 'En attente de transporteur') {
       return res.status(400).json({ message: 'Cette mission a déjà été prise.' });
     }
-    await pool.query(
-      `UPDATE transport_missions SET transporteur_id = $1, statut = 'Acceptée', updated_at = now() WHERE id = $2`,
-      [req.user.id, req.params.id],
+    const offerTimeout = await getCommissionPct('offer_timeout_seconds', 60);
+    const em = existing.rows[0];
+    const offerExpired = em.offered_at && Date.now() - new Date(em.offered_at).getTime() > offerTimeout * 1000;
+    if (em.offered_to && em.offered_to !== req.user.id && !offerExpired) {
+      return res.status(400).json({ message: 'Cette mission est proposée à un autre transporteur.' });
+    }
+    // Prix : celui proposé par le transporteur, sinon le prix estimé (comme Gozem)
+    let prix = Number(req.body?.prixTransportFcfa ?? req.body?.prix_transport_fcfa) ||
+      Number(em.prix_transport_fcfa);
+    if (!prix || prix < 100) {
+      return res.status(400).json({
+        message: 'Indiquez un prix de transport valide (minimum 100 FCFA).',
+      });
+    }
+    prix = Math.round(prix);
+    const claimed = await pool.query(
+      `UPDATE transport_missions SET
+         transporteur_id = $1,
+         prix_transport_fcfa = $2,
+         statut = 'En attente paiement transport',
+         updated_at = now()
+       WHERE id = $3 AND statut = 'En attente de transporteur'
+       RETURNING id`,
+      [req.user.id, prix, req.params.id],
     );
+    if (claimed.rowCount === 0) {
+      return res.status(400).json({ message: 'Cette mission a déjà été prise.' });
+    }
     const result = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [
       req.params.id,
     ]);
 
     await notifyUser(
       existing.rows[0].acheteur_id,
-      'transporteur_en_route',
-      {},
+      'mission_accepte_paiement',
+      { amount: String(prix) },
       { missionId: req.params.id },
     );
 
     res.json(serializeMission(result.rows[0]));
+  }),
+);
+
+/** Missions de l'acheteur (suivi + paiement transport) */
+router.get(
+  '/transport/missions/buyer',
+  requireAuth,
+  requireRole('acheteur', 'restaurant'),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT * FROM transport_missions WHERE acheteur_id = $1 ORDER BY created_at DESC`,
+      [req.user.id],
+    );
+    res.json(result.rows.map(serializeMission));
+  }),
+);
+
+/** Acheteur paie le transport AVANT le départ du transporteur */
+router.post(
+  '/transport/missions/:id/pay-transport',
+  requireAuth,
+  requireRole('acheteur', 'restaurant'),
+  asyncHandler(async (req, res) => {
+    const existing = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    const m = existing.rows[0];
+    if (!m) return res.status(404).json({ message: 'Mission introuvable.' });
+    if (m.acheteur_id !== req.user.id) return res.status(403).json({ message: 'Accès refusé.' });
+    if (m.statut !== 'En attente paiement transport') {
+      return res.status(400).json({
+        message: 'Cette mission n\'attend pas un paiement transport.',
+      });
+    }
+    const amount = Number(m.prix_transport_fcfa) || 0;
+    if (amount < 100) {
+      return res.status(400).json({ message: 'Prix de transport invalide.' });
+    }
+    await ensureWallet(req.user.id);
+    const w = await pool.query('SELECT solde_fcfa FROM wallets WHERE user_id = $1', [req.user.id]);
+    const solde = Number(w.rows[0]?.solde_fcfa || 0);
+    if (solde < amount) {
+      return res.status(400).json({
+        message: 'Solde portefeuille insuffisant pour payer le transport.',
+        soldeFcfa: solde,
+        montantRequis: amount,
+      });
+    }
+    // Débit acheteur
+    await pool.query(
+      `UPDATE wallets SET solde_fcfa = solde_fcfa - $1, updated_at = now() WHERE user_id = $2`,
+      [amount, req.user.id],
+    );
+    await pool.query(
+      `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+       VALUES ($1,$2,'debit',$3,'Paiement transport',$4)`,
+      [crypto.randomUUID(), req.user.id, amount, m.id],
+    );
+    await pool.query(
+      `UPDATE transport_missions SET statut = 'Transport payé', updated_at = now() WHERE id = $1`,
+      [m.id],
+    );
+    if (m.transporteur_id) {
+      await notifyUser(
+        m.transporteur_id,
+        'transport_paye_par_acheteur',
+        { amount: String(amount) },
+        { missionId: m.id },
+      );
+    }
+    const result = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [m.id]);
+    res.json({
+      message: 'Transport payé. Le transporteur peut démarrer.',
+      mission: serializeMission(result.rows[0]),
+    });
+  }),
+);
+
+/** Acheteur refuse le prix / le transport → se débrouille seul */
+router.post(
+  '/transport/missions/:id/refuse-transport',
+  requireAuth,
+  requireRole('acheteur', 'restaurant'),
+  asyncHandler(async (req, res) => {
+    const existing = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [req.params.id]);
+    const m = existing.rows[0];
+    if (!m) return res.status(404).json({ message: 'Mission introuvable.' });
+    if (m.acheteur_id !== req.user.id) return res.status(403).json({ message: 'Accès refusé.' });
+    if (!['En attente paiement transport', 'Acceptée'].includes(m.statut)) {
+      return res.status(400).json({ message: 'Impossible de refuser cette mission maintenant.' });
+    }
+    await pool.query(
+      `UPDATE transport_missions SET statut = 'Refusée par acheteur', updated_at = now() WHERE id = $1`,
+      [m.id],
+    );
+    if (m.transporteur_id) {
+      await notifyUser(
+        m.transporteur_id,
+        'transport_refuse_acheteur',
+        {},
+        { missionId: m.id },
+      );
+    }
+    const result = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [m.id]);
+    res.json({
+      message: 'Transport refusé. Organisez la récupération du produit par vos moyens.',
+      mission: serializeMission(result.rows[0]),
+    });
   }),
 );
 
@@ -2236,6 +3516,18 @@ router.patch(
     if (existing.rows[0].transporteur_id !== req.user.id) {
       return res.status(403).json({ message: 'Vous n\'êtes pas le transporteur de cette mission.' });
     }
+    // Départ uniquement après paiement transport par l'acheteur
+    if (statut === 'En route' && existing.rows[0].statut !== 'Transport payé') {
+      return res.status(400).json({
+        message: 'Le transporteur ne peut démarrer qu\'après le paiement du transport par l\'acheteur.',
+      });
+    }
+    if (statut === 'Arrivée' && existing.rows[0].statut !== 'En route') {
+      return res.status(400).json({ message: 'Passez d\'abord en « En route ».' });
+    }
+    if (statut === 'Livrée' && !['Arrivée', 'En route'].includes(existing.rows[0].statut)) {
+      return res.status(400).json({ message: 'Statut précédent invalide pour livrer.' });
+    }
     await pool.query(
       `UPDATE transport_missions SET
          statut = $1,
@@ -2246,6 +3538,9 @@ router.patch(
       [statut, lat ?? null, lng ?? null, req.params.id],
     );
     const m = existing.rows[0];
+    try {
+      io.to(`mission:${m.id}`).emit('statusChanged', { missionId: m.id, statut });
+    } catch (_) {}
     if (statut === 'En route') {
       await notifyUser(m.acheteur_id, 'transporteur_en_route', {}, { missionId: m.id });
     } else if (statut === 'Arrivée') {
@@ -2254,13 +3549,52 @@ router.patch(
       await notifyUser(m.acheteur_id, 'livraison_effectuee', {}, { missionId: m.id });
       if (m.order_id) {
         await pool.query(
-          `UPDATE orders SET statut = 'en_livraison', updated_at = now() WHERE id = $1 AND statut = 'paye'`,
+          `UPDATE orders SET statut = 'en_livraison', updated_at = now()
+           WHERE id = $1 AND statut IN ('paye','confirme')`,
           [m.order_id],
         );
-        await pool.query(
-          `UPDATE orders SET statut = 'livre', updated_at = now() WHERE id = $1`,
-          [m.order_id],
+      }
+      // Paiement automatique du transporteur (une seule fois)
+      if (m.transporteur_id) {
+        let amount = Number(m.prix_transport_fcfa) || 0;
+        // Si aucun prix fixé, estimer via config (montant minimal de base)
+        if (amount <= 0) {
+          amount = 1500; // minimum de base FCFA si non renseigné
+        }
+        const already = await pool.query(
+          `SELECT id FROM wallet_transactions
+           WHERE user_id = $1 AND reference_id = $2 AND type = 'credit'
+             AND motif = 'Transport mission' LIMIT 1`,
+          [m.transporteur_id, m.id],
         );
+        if (!already.rows[0]) {
+          const pct = await getCommissionPct('commission_transport_pct', 10);
+          const commission = Math.round(amount * (pct / 100));
+          const net = Math.max(0, amount - commission);
+          await ensureWallet(m.transporteur_id);
+          await pool.query(
+            `UPDATE wallets SET solde_fcfa = solde_fcfa + $1, updated_at = now() WHERE user_id = $2`,
+            [net, m.transporteur_id],
+          );
+          await pool.query(
+            `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+             VALUES ($1,$2,'credit',$3,'Transport mission',$4)`,
+            [crypto.randomUUID(), m.transporteur_id, net, m.id],
+          );
+          // Mémoriser le prix appliqué si absent
+          if (!m.prix_transport_fcfa) {
+            await pool.query(
+              `UPDATE transport_missions SET prix_transport_fcfa = $1 WHERE id = $2`,
+              [amount, m.id],
+            );
+          }
+          await notifyUser(
+            m.transporteur_id,
+            'transport_paye',
+            { amount: String(net) },
+            { missionId: m.id },
+          );
+        }
       }
     }
     // Broadcast socket
@@ -2325,54 +3659,81 @@ router.post(
   requireAuth,
   requireRole('acheteur', 'restaurant', 'admin'),
   asyncHandler(async (req, res) => {
-    const { orderId, origineLat, origineLng, destinationLat, destinationLng } = req.body;
-    if (!orderId || !origineLat || !origineLng || !destinationLat || !destinationLng) {
-      return res.status(400).json({ message: 'orderId et coordonnées requis.' });
-    }
+    let { orderId, origineLat, origineLng, destinationLat, destinationLng } = req.body;
+    const { transporteurId, auto } = req.body;
+    if (!orderId) return res.status(400).json({ message: 'orderId requis.' });
+    if (!UUID_RE.test(String(orderId))) return res.status(400).json({ message: 'Identifiant invalide.' });
     const ord = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
     if (!ord.rows[0]) return res.status(404).json({ message: 'Commande introuvable.' });
     const o = ord.rows[0];
     if (o.acheteur_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Accès refusé.' });
     }
-    if (!['paye', 'confirme'].includes(o.statut)) {
+    if (!['paye', 'confirme', 'en_livraison'].includes(o.statut)) {
       return res.status(400).json({ message: 'La commande doit être payée avant le transport.' });
     }
-    // Distance approx (Haversine simplifiée)
-    const toRad = (d) => (d * Math.PI) / 180;
-    const R = 6371;
-    const dLat = toRad(destinationLat - origineLat);
-    const dLng = toRad(destinationLng - origineLng);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(toRad(origineLat)) * Math.cos(toRad(destinationLat)) * Math.sin(dLng / 2) ** 2;
-    const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    const prixTransport = Math.max(500, Math.round(dist * 150)); // 150 FCFA/km min 500
+    // Origine = position du produit ; destination = adresse GPS de la commande (ou celle envoyée par l'app)
+    if (!validCoord(origineLat, origineLng)) {
+      const pr = await pool.query('SELECT latitude, longitude FROM products WHERE id = $1', [o.product_id]);
+      origineLat = pr.rows[0]?.latitude; origineLng = pr.rows[0]?.longitude;
+    }
+    if (!validCoord(destinationLat, destinationLng)) {
+      destinationLat = o.destination_lat; destinationLng = o.destination_lng;
+    }
+    if (!validCoord(origineLat, origineLng) || !validCoord(destinationLat, destinationLng)) {
+      return res.status(400).json({ message: 'orderId et coordonnées requis.' });
+    }
+    origineLat = Number(origineLat); origineLng = Number(origineLng);
+    destinationLat = Number(destinationLat); destinationLng = Number(destinationLng);
+    const dup = await pool.query(
+      `SELECT id FROM transport_missions WHERE order_id = $1 AND statut <> 'Annulée' AND statut <> 'Refusée par acheteur' LIMIT 1`,
+      [orderId],
+    );
+    if (dup.rows[0]) return res.status(409).json({ message: 'Une mission existe déjà pour cette commande.' });
+
+    const dist = haversineKm(Number(origineLat), Number(origineLng), Number(destinationLat), Number(destinationLng));
+    const est = await estimateTransport(dist);
+    const radius = await getCommissionPct('matching_rayon_km', 50);
+
+    // Choix du transporteur : explicite (liste "autour de moi"), automatique (le plus proche) ou ouvert à tous
+    let offered = null;
+    if (transporteurId) {
+      if (!UUID_RE.test(String(transporteurId))) return res.status(400).json({ message: 'Identifiant invalide.' });
+      const candidates = await findNearbyDrivers(origineLat, origineLng, radius, [], 50);
+      offered = candidates.find((d) => d.id === transporteurId) || null;
+      if (!offered) return res.status(400).json({ message: "Ce transporteur n'est pas disponible." });
+    } else if (auto === true) {
+      offered = (await findNearbyDrivers(origineLat, origineLng, radius, [], 1))[0] || null;
+    }
+
     const id = crypto.randomUUID();
     await pool.query(
       `INSERT INTO transport_missions (
         id, product_id, order_id, acheteur_id, origine_lat, origine_lng,
-        destination_lat, destination_lng, distance_km, prix_transport_fcfa, statut
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'En attente de transporteur')`,
+        destination_lat, destination_lng, distance_km, eta_minutes, prix_transport_fcfa, statut,
+        offered_to, offered_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'En attente de transporteur',$12, CASE WHEN $12::uuid IS NULL THEN NULL ELSE now() END)`,
       [
         id, o.product_id, orderId, o.acheteur_id,
         origineLat, origineLng, destinationLat, destinationLng,
-        Math.round(dist * 100) / 100, prixTransport,
+        Math.round(dist * 100) / 100, est.etaMinutes, est.prixFcfa, offered ? offered.id : null,
       ],
     );
-    // Notifier transporteurs de la région
-    const transporters = await pool.query(
-      `SELECT id FROM users WHERE role = 'transporteur' AND is_active = true LIMIT 50`,
-    );
-    for (const tr of transporters.rows) {
-      await notifyUser(tr.id, 'nouvelle_mission', { km: String(Math.round(dist)) }, { missionId: id });
+    if (offered) {
+      await notifyUser(offered.id, 'nouvelle_mission', { km: String(Math.round(dist)) }, { missionId: id });
+    } else {
+      // Ouverte à tous : prévenir les transporteurs en ligne les plus proches
+      const near = await findNearbyDrivers(origineLat, origineLng, radius, [], 10);
+      for (const d of near) {
+        await notifyUser(d.id, 'nouvelle_mission', { km: String(Math.round(dist)) }, { missionId: id });
+      }
     }
     await pool.query(
-      `UPDATE orders SET statut = 'en_livraison', updated_at = now() WHERE id = $1`,
+      `UPDATE orders SET statut = 'en_livraison', updated_at = now() WHERE id = $1 AND statut IN ('paye','confirme')`,
       [orderId],
     );
     const result = await pool.query('SELECT * FROM transport_missions WHERE id = $1', [id]);
-    res.status(201).json(serializeMission(result.rows[0]));
+    res.status(201).json({ ...serializeMission(result.rows[0]), offeredTo: offered });
   }),
 );
 
@@ -2703,19 +4064,36 @@ router.post(
     if (!secretKey) {
       return res.status(400).json({ message: 'PayStack non configuré côté serveur.' });
     }
-    const { montantFcfa, email, orderId } = req.body;
+    let { montantFcfa, email, orderId, purpose } = req.body;
+    if (orderId) {
+      const chk = await resolveOrderPayable(orderId, req.user.id);
+      if (chk.error) return res.status(chk.status).json({ message: chk.error });
+      montantFcfa = chk.amount; // on ignore le montant envoyé par le client
+    }
+    if (!montantFcfa || Number(montantFcfa) < 100) {
+      return res.status(400).json({ message: 'Montant invalide (min 100 FCFA).' });
+    }
+    const metaPurpose = purpose || (orderId ? 'order' : 'wallet_topup');
 
     const response = await axios.post(
       'https://api.paystack.co/transaction/initialize',
-      { email, amount: montantFcfa * 100, currency: 'XOF' },
+      {
+        email: email || `${req.user.phone.replace('+','')}@difa.app`,
+        amount: Math.round(Number(montantFcfa) * 100),
+        currency: 'XOF',
+        metadata: { purpose: metaPurpose, userId: req.user.id, orderId: orderId || null },
+      },
       { headers: { Authorization: `Bearer ${secretKey}` } },
     );
 
     const id = crypto.randomUUID();
     await pool.query(
-      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut, reference_externe)
-       VALUES ($1,$2,$3,$4,'carte','en_attente',$5)`,
-      [id, req.user.id, orderId || null, montantFcfa, response.data.data.reference],
+      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut, reference_externe, metadata)
+       VALUES ($1,$2,$3,$4,'carte','en_attente',$5,$6)`,
+      [
+        id, req.user.id, orderId || null, montantFcfa, response.data.data.reference,
+        JSON.stringify({ purpose: metaPurpose, provider: 'paystack' }),
+      ],
     );
 
     res.json({
@@ -2740,15 +4118,18 @@ router.post(
 
     const event = req.body;
     if (event.event === 'charge.success') {
+      const paidFcfa = Number(event.data.amount) / 100;
       const tx = await pool.query(
-        `UPDATE transactions SET statut = 'reussi', metadata = $1 WHERE reference_externe = $2
+        `UPDATE transactions SET statut = 'reussi', metadata = $1
+         WHERE reference_externe = $2 AND statut = 'en_attente' AND montant_fcfa <= $3
          RETURNING user_id, montant_fcfa, order_id`,
-        [JSON.stringify(event.data), event.data.reference],
+        [JSON.stringify(event.data), event.data.reference, paidFcfa],
       );
       if (tx.rows[0]) {
         if (tx.rows[0].order_id) {
           await pool.query(
-            `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+            `UPDATE orders SET statut = 'paye', updated_at = now()
+             WHERE id = $1 AND statut = 'en_attente_paiement'`,
             [tx.rows[0].order_id],
           );
           const ord = await pool.query('SELECT agriculteur_id FROM orders WHERE id = $1', [
@@ -2762,11 +4143,18 @@ router.post(
               { orderId: tx.rows[0].order_id },
             );
           }
+        } else {
+          await creditWalletOnce(
+            tx.rows[0].user_id,
+            tx.rows[0].montant_fcfa,
+            'Recharge Paystack',
+            event.data.reference,
+          );
         }
         await notifyUser(
           tx.rows[0].user_id,
           'paiement_recu',
-          { amount: tx.rows[0].montant_fcfa },
+          { amount: String(tx.rows[0].montant_fcfa) },
           { reference: event.data.reference },
         );
       }
@@ -2779,13 +4167,26 @@ router.post(
   '/payments/mobile-money/initiate',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { montantFcfa, phone, provider, orderId } = req.body;
-    if (!montantFcfa || montantFcfa <= 0) {
-      return res.status(400).json({ message: 'montantFcfa requis.' });
+    let { montantFcfa, phone, provider, orderId } = req.body;
+    if (orderId) {
+      const chk = await resolveOrderPayable(orderId, req.user.id);
+      if (chk.error) return res.status(chk.status).json({ message: chk.error });
+      montantFcfa = chk.amount;
     }
-    const operateur = (provider || 'tmoney').toLowerCase(); // tmoney | flooz | wave
-    if (!['tmoney', 'flooz', 'wave'].includes(operateur)) {
-      return res.status(400).json({ message: 'provider doit être tmoney, flooz ou wave.' });
+    montantFcfa = Math.round(Number(montantFcfa) || 0);
+    if (montantFcfa < 100 || montantFcfa > 2000000) {
+      return res.status(400).json({ message: 'Montant invalide (100 à 2 000 000 FCFA).' });
+    }
+    const operateur = String(provider || 'tmoney').toLowerCase().replace(/\s+/g, '_');
+    const MM_PROVIDERS = [
+      'tmoney', 'flooz', 'wave', 'mtn_momo', 'vodafone_cash', 'airtel_money',
+      'orange_money', 'moov_money', 'free_money'
+    ];
+    if (!MM_PROVIDERS.includes(operateur)) {
+      return res.status(400).json({
+        message: 'provider invalide.',
+        allowed: MM_PROVIDERS,
+      });
     }
     const id = crypto.randomUUID();
     const ref = `MM-${operateur.toUpperCase()}-${id.slice(0, 8)}`;
@@ -2801,17 +4202,21 @@ router.post(
 
     // Mode sandbox fonctionnel : si MOBILE_MONEY_SANDBOX=true (défaut) on confirme après 2s
     // En production, brancher l'API officielle T-Money / Flooz / Wave ici.
-    const sandbox = process.env.MOBILE_MONEY_SANDBOX !== 'false';
+    // SÉCURITÉ : le sandbox crédite de l'argent fictif. Il n'est actif que si
+    // MOBILE_MONEY_SANDBOX=true est défini explicitement (jamais par défaut).
+    const sandbox = SANDBOX_PAYMENTS;
     if (sandbox) {
       setTimeout(async () => {
         try {
-          await pool.query(
-            `UPDATE transactions SET statut = 'reussi' WHERE id = $1 AND statut = 'en_attente'`,
+          const claimed = await pool.query(
+            `UPDATE transactions SET statut = 'reussi' WHERE id = $1 AND statut = 'en_attente' RETURNING id`,
             [id],
           );
+          if (claimed.rowCount === 0) return;
           if (orderId) {
             await pool.query(
-              `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+              `UPDATE orders SET statut = 'paye', updated_at = now()
+               WHERE id = $1 AND statut = 'en_attente_paiement'`,
               [orderId],
             );
             const ord = await pool.query('SELECT agriculteur_id FROM orders WHERE id = $1', [orderId]);
@@ -2820,6 +4225,9 @@ router.post(
                 amount: String(montantFcfa),
               }, { orderId });
             }
+          } else {
+            // Recharge portefeuille
+            await creditWalletOnce(req.user.id, montantFcfa, `Recharge ${operateur}`, id);
           }
           await notifyUser(req.user.id, 'paiement_recu', { amount: String(montantFcfa) }, {
             transactionId: id,
@@ -2852,19 +4260,233 @@ router.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { transactionId } = req.body;
+    // Seul un admin (ou le webhook d'un opérateur) peut valider un paiement.
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Réservé aux administrateurs.' });
+    }
+    if (!transactionId || !UUID_RE.test(String(transactionId))) {
+      return res.status(400).json({ message: 'transactionId invalide.' });
+    }
     const tx = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
     if (!tx.rows[0]) return res.status(404).json({ message: 'Transaction introuvable.' });
-    if (tx.rows[0].user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Accès refusé.' });
+    const claimed = await pool.query(
+      `UPDATE transactions SET statut = 'reussi' WHERE id = $1 AND statut = 'en_attente' RETURNING id`,
+      [transactionId],
+    );
+    if (claimed.rowCount === 0) {
+      return res.status(400).json({ message: 'Transaction déjà traitée.' });
     }
-    await pool.query(`UPDATE transactions SET statut = 'reussi' WHERE id = $1`, [transactionId]);
     if (tx.rows[0].order_id) {
       await pool.query(
-        `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1`,
+        `UPDATE orders SET statut = 'paye', updated_at = now()
+         WHERE id = $1 AND statut = 'en_attente_paiement'`,
         [tx.rows[0].order_id],
+      );
+    } else {
+      await creditWalletOnce(
+        tx.rows[0].user_id,
+        tx.rows[0].montant_fcfa,
+        'Recharge mobile money',
+        transactionId,
       );
     }
     res.json({ message: 'Paiement confirmé.', statut: 'reussi' });
+  }),
+);
+
+
+/** Liste des moyens de paiement supportés (UI multi-langue côté app) */
+router.get(
+  '/payments/providers',
+  requireAuth,
+  asyncHandler(async (_req, res) => {
+    res.json({
+      mobileMoney: [
+        { id: 'tmoney', name: 'TMoney', countries: ['TG'] },
+        { id: 'flooz', name: 'Flooz', countries: ['TG', 'BJ'] },
+        { id: 'wave', name: 'Wave', countries: ['TG', 'SN', 'CI'] },
+        { id: 'mtn_momo', name: 'MTN MoMo', countries: ['GH', 'CI', 'CM', 'BJ'] },
+        { id: 'vodafone_cash', name: 'Vodafone Cash', countries: ['GH'] },
+        { id: 'airtel_money', name: 'Airtel Money', countries: ['NE', 'TD'] },
+        { id: 'orange_money', name: 'Orange Money', countries: ['CI', 'SN', 'ML', 'BF'] },
+        { id: 'moov_money', name: 'Moov Money', countries: ['TG', 'BJ', 'CI'] },
+      ],
+      cards: [
+        { id: 'paystack', name: 'Paystack (Visa / Mastercard)' },
+        { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
+        { id: 'card_ecobank', name: 'Carte Ecobank (via Paystack/Flutterwave)' },
+        { id: 'card_orabank', name: 'Carte Orabank (via Paystack/Flutterwave)' },
+      ],
+      note: 'Ecobank/Orabank passent par Paystack ou Flutterwave (pas d API banque directe).',
+    });
+  }),
+);
+
+/** Flutterwave — init recharge / paiement */
+router.post(
+  '/payments/flutterwave/initiate',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const secret = process.env.FLUTTERWAVE_SECRET_KEY;
+    if (!secret) {
+      return res.status(400).json({ message: 'Flutterwave non configuré (FLUTTERWAVE_SECRET_KEY).' });
+    }
+    let { montantFcfa, email, orderId, purpose, phone } = req.body;
+    if (orderId) {
+      const chk = await resolveOrderPayable(orderId, req.user.id);
+      if (chk.error) return res.status(chk.status).json({ message: chk.error });
+      montantFcfa = chk.amount;
+    }
+    if (!montantFcfa || Number(montantFcfa) < 100) {
+      return res.status(400).json({ message: 'Montant invalide (min 100 FCFA).' });
+    }
+    const metaPurpose = purpose || (orderId ? 'order' : 'wallet_topup');
+    const txRef = `FLW-${crypto.randomUUID().slice(0, 12)}`;
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut, reference_externe, metadata)
+       VALUES ($1,$2,$3,$4,'carte','en_attente',$5,$6)`,
+      [
+        id, req.user.id, orderId || null, montantFcfa, txRef,
+        JSON.stringify({ purpose: metaPurpose, provider: 'flutterwave' }),
+      ],
+    );
+    try {
+      const response = await axios.post(
+        'https://api.flutterwave.com/v3/payments',
+        {
+          tx_ref: txRef,
+          amount: Number(montantFcfa),
+          currency: 'XOF',
+          redirect_url: process.env.FLUTTERWAVE_REDIRECT_URL || 'https://difabackenf.onrender.com/payments/flutterwave/return',
+          customer: {
+            email: email || `${String(req.user.phone).replace('+','')}@difa.app`,
+            phonenumber: phone || req.user.phone,
+          },
+          meta: { userId: req.user.id, orderId: orderId || null, purpose: metaPurpose },
+          customizations: { title: 'Difa', description: metaPurpose === 'wallet_topup' ? 'Recharge portefeuille' : 'Paiement Difa' },
+        },
+        { headers: { Authorization: `Bearer ${secret}` } },
+      );
+      const link = response.data?.data?.link;
+      res.json({
+        authorizationUrl: link,
+        reference: txRef,
+        transactionId: id,
+        provider: 'flutterwave',
+      });
+    } catch (err) {
+      console.error('[Flutterwave] init', err.response?.data || err.message);
+      res.status(502).json({ message: 'Impossible d initier Flutterwave.' });
+    }
+  }),
+);
+
+/** Webhook Flutterwave */
+router.post(
+  '/payments/flutterwave/webhook',
+  asyncHandler(async (req, res) => {
+    const secretHash = process.env.FLUTTERWAVE_SECRET_HASH || '';
+    const signature = req.headers['verif-hash'];
+    // Signature OBLIGATOIRE : sans FLUTTERWAVE_SECRET_HASH le webhook est refusé.
+    if (!secretHash || !signature || signature !== secretHash) {
+      return res.status(200).json({ received: false, reason: 'invalid_signature' });
+    }
+    const body = req.body || {};
+    const status = body.status || body.data?.status;
+    const txRef = body.txRef || body.tx_ref || body.data?.tx_ref;
+    const amount = body.amount || body.data?.amount;
+    if (String(status).toLowerCase() === 'successful' && txRef) {
+      const tx = await pool.query(
+        `UPDATE transactions SET statut = 'reussi', metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+         WHERE reference_externe = $2 AND statut = 'en_attente' AND montant_fcfa <= $3
+         RETURNING user_id, montant_fcfa, order_id`,
+        [JSON.stringify(body.data || body), txRef, Number(amount) || 0],
+      );
+      if (tx.rows[0]) {
+        if (tx.rows[0].order_id) {
+          await pool.query(`UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1 AND statut = 'en_attente_paiement'`, [tx.rows[0].order_id]);
+        } else {
+          await creditWalletOnce(tx.rows[0].user_id, tx.rows[0].montant_fcfa, 'Recharge Flutterwave', txRef);
+        }
+        await notifyUser(tx.rows[0].user_id, 'paiement_recu', { amount: String(tx.rows[0].montant_fcfa || amount) }, {});
+      }
+    }
+    res.json({ received: true });
+  }),
+);
+
+/** Retrait portefeuille → Mobile Money / banque (sandbox ou API réelle) */
+router.post(
+  '/wallet/withdraw',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { montantFcfa, provider, destination, accountName } = req.body;
+    const amount = Math.round(Number(montantFcfa) || 0);
+    if (amount < 500) {
+      return res.status(400).json({ message: 'Montant minimum de retrait : 500 FCFA.' });
+    }
+    if (!provider || !destination) {
+      return res.status(400).json({ message: 'provider et destination (téléphone ou compte) requis.' });
+    }
+    await ensureWallet(req.user.id);
+    const id = crypto.randomUUID();
+    const ref = `WD-${id.slice(0, 8)}`;
+    // Débit + historique + demande de retrait dans UNE transaction :
+    // soit tout réussit, soit rien (jamais d'argent débité sans trace).
+    const okDebit = await withTransaction(async (c) => {
+      const debit = await c.query(
+        `UPDATE wallets SET solde_fcfa = solde_fcfa - $1, updated_at = now()
+         WHERE user_id = $2 AND solde_fcfa >= $1 RETURNING solde_fcfa`,
+        [amount, req.user.id],
+      );
+      if (debit.rowCount === 0) return false;
+      await c.query(
+        `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+         VALUES ($1,$2,'debit',$3,$4,$5)`,
+        [crypto.randomUUID(), req.user.id, amount, `Retrait ${provider}`, ref],
+      );
+      await c.query(
+        `INSERT INTO transactions (id, user_id, montant_fcfa, methode, statut, reference_externe, operateur, telephone_paiement, metadata)
+         VALUES ($1,$2,$3,'mobile_money','en_attente',$4,$5,$6,$7)`,
+        [
+          id, req.user.id, amount, ref, String(provider).toLowerCase(),
+          String(destination),
+          JSON.stringify({ type: 'withdraw', accountName: accountName || null, sandbox: SANDBOX_PAYMENTS }),
+        ],
+      );
+      return true;
+    });
+    if (!okDebit) {
+      const w = await pool.query('SELECT solde_fcfa FROM wallets WHERE user_id = $1', [req.user.id]);
+      return res.status(400).json({ message: 'Solde insuffisant.', soldeFcfa: Number(w.rows[0]?.solde_fcfa || 0) });
+    }
+    const sandbox = SANDBOX_PAYMENTS;
+    if (sandbox) {
+      setTimeout(async () => {
+        try {
+          await pool.query(`UPDATE transactions SET statut = 'reussi' WHERE id = $1`, [id]);
+          await notifyUser(req.user.id, 'retrait_reussi', { amount: String(amount) }, { reference: ref });
+          console.log(`[Withdraw][Sandbox] OK ${ref} ${amount} → ${provider} ${destination}`);
+        } catch (e) {
+          console.error('[Withdraw] sandbox', e.message);
+        }
+      }, 1500);
+    } else {
+      // Production : brancher Paystack Transfer / Flutterwave Transfer / API opérateur
+      console.warn(`[Withdraw] Prod — exécuter transfert ${provider} ${destination} ${amount} FCFA (${ref})`);
+    }
+    res.status(201).json({
+      message: sandbox
+        ? 'Retrait initié (sandbox). Confirmation automatique sous peu.'
+        : 'Retrait en cours de traitement.',
+      reference: ref,
+      transactionId: id,
+      montantFcfa: amount,
+      provider,
+      destination,
+      sandbox,
+    });
   }),
 );
 
@@ -2883,14 +4505,27 @@ router.post(
       return res.status(400).json({ message: 'Commande déjà traitée.' });
     }
     await ensureWallet(req.user.id);
-    const w = await pool.query('SELECT solde_fcfa FROM wallets WHERE user_id = $1', [req.user.id]);
-    if (w.rows[0].solde_fcfa < o.montant_total_fcfa) {
-      return res.status(400).json({ message: 'Solde portefeuille insuffisant.' });
+    // Verrou : la commande ne peut être payée qu'une fois (statut passe à 'paye' atomiquement)
+    const lock = await pool.query(
+      `UPDATE orders SET statut = 'paye', updated_at = now()
+       WHERE id = $1 AND statut = 'en_attente_paiement' RETURNING id`,
+      [orderId],
+    );
+    if (lock.rowCount === 0) {
+      return res.status(400).json({ message: 'Commande déjà traitée.' });
     }
-    await pool.query(
-      `UPDATE wallets SET solde_fcfa = solde_fcfa - $1, updated_at = now() WHERE user_id = $2`,
+    const debit = await pool.query(
+      `UPDATE wallets SET solde_fcfa = solde_fcfa - $1, updated_at = now()
+       WHERE user_id = $2 AND solde_fcfa >= $1 RETURNING solde_fcfa`,
       [o.montant_total_fcfa, req.user.id],
     );
+    if (debit.rowCount === 0) {
+      await pool.query(
+        `UPDATE orders SET statut = 'en_attente_paiement', updated_at = now() WHERE id = $1`,
+        [orderId],
+      );
+      return res.status(400).json({ message: 'Solde portefeuille insuffisant.' });
+    }
     await pool.query(
       `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
        VALUES ($1,$2,'debit',$3,'Paiement commande',$4)`,
@@ -3016,18 +4651,6 @@ const NOTIF_I18N = {
     yo: { title: 'A ti rí awakọ̀', body: 'Awakọ̀ kan ti gba àṣẹ rẹ yóò sì gbé e.' },
     kbp: { title: 'Tɩlɩyʊ wɛ ŋgbe', body: 'Tɩlɩyʊ wɛ ŋgbe mission yɔɔ.' },
   },
-  livraison_arrivee: {
-    fr: { title: 'Livraison effectuée', body: 'Votre commande a été livrée avec succès.' },
-    en: { title: 'Delivery completed', body: 'Your order was delivered successfully.' },
-    ee: { title: 'Wotsɔ nu va', body: 'Wotsɔ wò ɖoɖo va nyuie.' },
-    ha: { title: 'An kammala isar da kaya', body: 'An isar da odar ku cikin nasara.' },
-    es: { title: 'Entrega realizada', body: 'Su pedido se entregó correctamente.' },
-    pt: { title: 'Entrega concluída', body: 'A sua encomenda foi entregue com sucesso.' },
-    ar: { title: 'تم التسليم', body: 'تم تسليم طلبك بنجاح.' },
-    zh: { title: '配送完成', body: '您的订单已成功送达。' },
-    yo: { title: 'Ìfijiṣẹ́ ti parí', body: 'A ti fi ọ̀rọ̀ rẹ ránṣẹ́ ní àṣeyọrí.' },
-    kbp: { title: 'Livraison effectuée', body: 'Wà commande ɖe va nyuie.' },
-  },
   paiement_recu: {
     fr: { title: 'Paiement confirmé', body: 'Votre paiement de {amount} FCFA a été reçu avec succès.' },
     en: { title: 'Payment confirmed', body: 'Your payment of {amount} FCFA was received successfully.' },
@@ -3041,6 +4664,8 @@ const NOTIF_I18N = {
     kbp: { title: 'Liidiye ɖɔ', body: 'Woxɔ wà liidiye {amount} FCFA nyuie.' },
   },
   nouvelle_commande: {
+    ar: {"title": "طلب جديد", "body": "تم استلام طلب لـ \"{name}\" (x{qty})."},
+    zh: {"title": "新订单", "body": "收到“{name}”的订单（x{qty}）。"},
     fr: { title: 'Nouvelle commande', body: 'Commande reçue pour "{name}" (x{qty}).' },
     en: { title: 'New order', body: 'Order received for "{name}" (x{qty}).' },
     ee: { title: 'Asixɔ yeye', body: 'Asixɔ va na "{name}" (x{qty}).' },
@@ -3051,6 +4676,8 @@ const NOTIF_I18N = {
     pt: { title: 'Novo pedido', body: 'Pedido de "{name}" (x{qty}).' },
   },
   commande_annulee: {
+    ar: {"title": "تم إلغاء الطلب", "body": "تم إلغاء طلب."},
+    zh: {"title": "订单已取消", "body": "一个订单已被取消。"},
     fr: { title: 'Commande annulée', body: 'Une commande a été annulée.' },
     en: { title: 'Order cancelled', body: 'An order was cancelled.' },
     ee: { title: 'Asixɔ ƒe ɖeɖe', body: 'Asixɔ aɖe ɖe ɖe.' },
@@ -3061,6 +4688,8 @@ const NOTIF_I18N = {
     pt: { title: 'Pedido cancelado', body: 'Um pedido foi cancelado.' },
   },
   commande_livree: {
+    ar: {"title": "تم تسليم الطلب", "body": "تم تأكيد التسليم. +{amount} فرنك أضيفت إلى رصيدك."},
+    zh: {"title": "订单已送达", "body": "已确认收货。+{amount} FCFA 已入账。"},
     fr: { title: 'Commande livrée', body: 'Livraison confirmée. +{amount} FCFA crédités.' },
     en: { title: 'Order delivered', body: 'Delivery confirmed. +{amount} FCFA credited.' },
     ee: { title: 'Asixɔ wɔ', body: 'Nɔnɔme kɔ. +{amount} FCFA.' },
@@ -3071,6 +4700,8 @@ const NOTIF_I18N = {
     pt: { title: 'Pedido entregue', body: 'Entrega confirmada. +{amount} FCFA.' },
   },
   kyc_valide: {
+    ar: {"title": "تم قبول التحقق", "body": "تم التحقق من هويتك.{reason}"},
+    zh: {"title": "KYC 已通过", "body": "您的身份已验证。{reason}"},
     fr: { title: 'KYC validé', body: 'Votre identité a été vérifiée.{reason}' },
     en: { title: 'KYC approved', body: 'Your identity was verified.{reason}' },
     ee: { title: 'KYC sɔ', body: 'Wò ŋkɔ sɔ.{reason}' },
@@ -3081,6 +4712,8 @@ const NOTIF_I18N = {
     pt: { title: 'KYC validado', body: 'Identidade verificada.{reason}' },
   },
   kyc_rejete: {
+    ar: {"title": "تم رفض التحقق", "body": "تم رفض التحقق.{reason}"},
+    zh: {"title": "KYC 被拒绝", "body": "验证未通过。{reason}"},
     fr: { title: 'KYC rejeté', body: 'Vérification refusée.{reason}' },
     en: { title: 'KYC rejected', body: 'Verification refused.{reason}' },
     ee: { title: 'KYC gbe', body: 'Wogbe.{reason}' },
@@ -3091,6 +4724,8 @@ const NOTIF_I18N = {
     pt: { title: 'KYC rejeitado', body: 'Verificação recusada.{reason}' },
   },
   alerte_agricole: {
+    ar: {"title": "{title}", "body": "{msg}"},
+    zh: {"title": "{title}", "body": "{msg}"},
     fr: { title: '{title}', body: '{msg}' },
     en: { title: '{title}', body: '{msg}' },
     ee: { title: '{title}', body: '{msg}' },
@@ -3101,6 +4736,8 @@ const NOTIF_I18N = {
     pt: { title: '{title}', body: '{msg}' },
   },
   nouvelle_mission: {
+    ar: {"title": "مهمة جديدة", "body": "مهمة نقل متاحة (~{km} كم)."},
+    zh: {"title": "新任务", "body": "有可接运输任务（约 {km} 公里）。"},
     fr: { title: 'Nouvelle mission', body: 'Mission transport disponible (~{km} km).' },
     en: { title: 'New mission', body: 'Transport mission available (~{km} km).' },
     ee: { title: 'Dɔ yeye', body: 'Dɔ transport (~{km} km).' },
@@ -3111,6 +4748,8 @@ const NOTIF_I18N = {
     pt: { title: 'Nova missão', body: 'Missão de transporte (~{km} km).' },
   },
   livraison_arrivee: {
+    ar: { title: 'وصل الناقل', body: 'وصل الناقل إلى نقطة التسليم.' },
+    zh: { title: '运输员已到达', body: '运输员已到达送货地点。' },
     fr: { title: 'Transporteur arrivé', body: 'Le transporteur est arrivé au point de livraison.' },
     en: { title: 'Transporter arrived', body: 'The transporter arrived at the delivery point.' },
     ee: { title: 'Transport va', body: 'Transport va ɖe afisi.' },
@@ -3121,6 +4760,8 @@ const NOTIF_I18N = {
     pt: { title: 'Transportador chegou', body: 'Chegou ao ponto de entrega.' },
   },
   livraison_effectuee: {
+    ar: {"title": "تم التسليم", "body": "تم تسليم طلبك. يرجى تأكيد الاستلام."},
+    zh: {"title": "已送达", "body": "您的包裹已送达，请确认收货。"},
     fr: { title: 'Livraison effectuée', body: 'Votre colis a été livré. Confirmez la réception.' },
     en: { title: 'Delivery done', body: 'Your package was delivered. Please confirm.' },
     ee: { title: 'Nɔnɔme wɔ', body: 'Nɔnɔme wɔ. Kɔe.' },
@@ -3131,6 +4772,8 @@ const NOTIF_I18N = {
     pt: { title: 'Entrega feita', body: 'Encomenda entregue. Confirme.' },
   },
   nouveau_litige: {
+    ar: {"title": "نزاع جديد", "body": "تم فتح نزاع: {motif}"},
+    zh: {"title": "新纠纷", "body": "已发起纠纷：{motif}"},
     fr: { title: 'Nouveau litige', body: 'Litige ouvert : {motif}' },
     en: { title: 'New dispute', body: 'Dispute opened: {motif}' },
     ee: { title: 'Nya yeye', body: 'Nya : {motif}' },
@@ -3140,7 +4783,70 @@ const NOTIF_I18N = {
     es: { title: 'Nueva disputa', body: 'Disputa: {motif}' },
     pt: { title: 'Nova disputa', body: 'Disputa: {motif}' },
   },
+  mission_accepte_paiement: {
+    fr: { title: 'Mission acceptée', body: 'Un transporteur a accepté. Payez {amount} FCFA pour le transport avant le départ.' },
+    en: { title: 'Mission accepted', body: 'A transporter accepted. Pay {amount} FCFA for transport before departure.' },
+    ee: { title: 'Woxɔ dɔ', body: 'Kɔkɔɖeanyi xɔe. Ga {amount} FCFA hafi wòadze agbagba.' },
+    kbp: { title: 'Mission acceptée', body: 'Transporteur accepté. Fɛɛlɩ {amount} FCFA avant départ.' },
+    ha: { title: 'An karɓi manufa', body: 'Mai jigila ya yarda. Biya {amount} FCFA kafin tafiya.' },
+    yo: { title: 'Iṣẹ́ gba', body: 'Olùgbé ti gba. San {amount} FCFA kí ó tó bẹ̀rẹ̀.' },
+    es: { title: 'Misión aceptada', body: 'Un transportista aceptó. Pague {amount} FCFA antes de la salida.' },
+    pt: { title: 'Missão aceite', body: 'Um transportador aceitou. Pague {amount} FCFA antes da partida.' },
+    ar: { title: 'تم قبول المهمة', body: 'قبل الناقل. ادفع {amount} فرنك قبل المغادرة.' },
+    zh: { title: '任务已接受', body: '承运人已接受。出发前请支付 {amount} FCFA 运费。' },
+  },
+  transport_paye_par_acheteur: {
+    fr: { title: 'Transport payé', body: "L'acheteur a payé {amount} FCFA. Vous pouvez démarrer la mission." },
+    en: { title: 'Transport paid', body: 'The buyer paid {amount} FCFA. You can start the mission.' },
+    ee: { title: 'Woxɔ ga', body: 'Asitsala xɔ {amount} FCFA. Àte ŋu adze agbagba.' },
+    kbp: { title: 'Transport payé', body: 'Acheteur fɛɛlɩ {amount} FCFA. Démarrez.' },
+    ha: { title: 'An biya jigila', body: 'Mai saya ya biya {amount} FCFA. Za ku iya farawa.' },
+    yo: { title: 'A san gbigbe', body: 'Oníbàárà san {amount} FCFA. O le bẹ̀rẹ̀.' },
+    es: { title: 'Transporte pagado', body: 'El comprador pagó {amount} FCFA. Puede iniciar.' },
+    pt: { title: 'Transporte pago', body: 'O comprador pagou {amount} FCFA. Pode iniciar.' },
+    ar: { title: 'تم دفع النقل', body: 'دفع المشتري {amount} فرنك. يمكنك البدء.' },
+    zh: { title: '运费已付', body: '买家已支付 {amount} FCFA。可以出发。' },
+  },
+  transport_refuse_acheteur: {
+    fr: { title: 'Transport refusé', body: "L'acheteur a refusé le transport. Mission annulée de votre côté." },
+    en: { title: 'Transport refused', body: 'The buyer refused transport. Mission cancelled on your side.' },
+    ee: { title: 'Wogbe kɔkɔɖeanyi', body: 'Asitsala gbe. Dɔa wu.' },
+    kbp: { title: 'Transport refusé', body: 'Acheteur a refusé. Mission annulée.' },
+    ha: { title: 'An ƙi jigila', body: 'Mai saya ya ƙi. An soke manufa.' },
+    yo: { title: 'Kọ gbigbe', body: 'Oníbàárà kọ̀. Iṣẹ́ ti parẹ́.' },
+    es: { title: 'Transporte rechazado', body: 'El comprador rechazó el transporte. Misión cancelada.' },
+    pt: { title: 'Transporte recusado', body: 'O comprador recusou o transporte. Missão cancelada.' },
+    ar: { title: 'رفض النقل', body: 'رفض المشتري النقل. ألغيت المهمة.' },
+    zh: { title: '拒绝运输', body: '买家拒绝运输。任务已取消。' },
+  },
+  retrait_reussi: {
+    fr: { title: 'Retrait réussi', body: '{amount} FCFA envoyés vers votre compte.' },
+    en: { title: 'Withdrawal successful', body: '{amount} FCFA sent to your account.' },
+    ee: { title: 'Ga ɖe go', body: '{amount} FCFA yi wò akɔnta me.' },
+    kbp: { title: 'Retrait OK', body: '{amount} FCFA ɖe compte.' },
+    ha: { title: 'An yi nasarar cirewa', body: 'An aika {amount} FCFA zuwa asusun ku.' },
+    yo: { title: 'Yiyọ́ ṣaṣeyọri', body: 'A fi {amount} FCFA ránṣẹ́ sí àkántì rẹ.' },
+    es: { title: 'Retiro exitoso', body: '{amount} FCFA enviados a su cuenta.' },
+    pt: { title: 'Levantamento OK', body: '{amount} FCFA enviados para a sua conta.' },
+    ar: { title: 'سحب ناجح', body: 'تم إرسال {amount} فرنك إلى حسابك.' },
+    zh: { title: '提现成功', body: '已向您的账户发送 {amount} FCFA。' },
+  },
+  transport_paye: {
+    fr: { title: 'Paiement transport', body: 'Livraison terminée. +{amount} FCFA crédités sur votre portefeuille.' },
+    en: { title: 'Transport payment', body: 'Delivery completed. +{amount} FCFA credited to your wallet.' },
+    ee: { title: 'Gaƒoƒo kɔkɔɖeanyi', body: 'Wotsɔe vɔ. +{amount} FCFA le wò wallet me.' },
+    kbp: { title: 'Fɛɛlɩ transport', body: 'Livraison wɛ. +{amount} FCFA ɖe wallet.' },
+    ha: { title: 'Biyan jigila', body: 'An kammala isarwa. +{amount} FCFA an cika wallet.' },
+    yo: { title: 'Isanwo gbigbe', body: 'Ikojọpọ pari. +{amount} FCFA ti wa si wallet.' },
+    es: { title: 'Pago transporte', body: 'Entrega completada. +{amount} FCFA en su billetera.' },
+    pt: { title: 'Pagamento transporte', body: 'Entrega concluída. +{amount} FCFA na carteira.' },
+    ar: { title: 'دفع النقل', body: 'اكتملت التسليم. +{amount} فرنك في محفظتك.' },
+    yo: { title: 'Isanwo gbigbe', body: 'Ikojọpọ pari. +{amount} FCFA ti wa si wallet.' },
+    zh: { title: '运输付款', body: '配送完成。+{amount} FCFA 已入账。' },
+  },
   note_basse: {
+    ar: {"title": "تنبيه التقييم", "body": "متوسط تقييمك {note}/5. حسّن خدمتك."},
+    zh: {"title": "评分偏低", "body": "您的平均评分为 {note}/5，请改进服务。"},
     fr: { title: 'Attention note', body: 'Votre note moyenne est de {note}/5. Améliorez votre service.' },
     en: { title: 'Low rating', body: 'Your average rating is {note}/5. Improve your service.' },
     ee: { title: 'Note kpakpa', body: 'Note {note}/5.' },
@@ -3720,63 +5426,67 @@ const io = new SocketIOServer(httpServer, {
   path: '/tracking/socket.io',
 });
 
-io.on('connection', (socket) => {
-  console.log(`[Socket.io] Client connecté : ${socket.id}`);
+// Authentification : le client doit fournir son JWT (auth.token) à la connexion.
+io.use((socket, next) => {
+  try {
+    const token =
+      socket.handshake.auth?.token ||
+      (socket.handshake.headers.authorization || '').replace(/^Bearer /, '');
+    if (!token) return next(new Error('unauthorized'));
+    const payload = jwt.verify(token, JWT_ACCESS_SECRET);
+    socket.user = { id: payload.sub, role: payload.role };
+    next();
+  } catch (_) {
+    next(new Error('unauthorized'));
+  }
+});
 
-  socket.on('joinMission', (missionId) => {
-    socket.join(`mission:${missionId}`);
-    socket.emit('joinedMission', { missionId });
+io.on('connection', (socket) => {
+  console.log(`[Socket.io] Client connecté : ${socket.id} (${socket.user.role})`);
+
+  // Rejoindre une mission : uniquement acheteur, transporteur assigné ou admin
+  socket.on('joinMission', async (missionId) => {
+    try {
+      if (!UUID_RE.test(String(missionId))) return;
+      const r = await pool.query(
+        'SELECT acheteur_id, transporteur_id FROM transport_missions WHERE id = $1',
+        [missionId],
+      );
+      const m = r.rows[0];
+      if (!m) return;
+      const uid = socket.user.id;
+      if (m.acheteur_id !== uid && m.transporteur_id !== uid && socket.user.role !== 'admin') return;
+      socket.join(`mission:${missionId}`);
+      socket.emit('joinedMission', { missionId });
+    } catch (err) {
+      console.error('[Socket.io] joinMission :', err.message);
+    }
   });
 
-  // Fréquence recommandée côté mobile : toutes les 5 secondes
-  socket.on('positionUpdate', async ({ missionId, lat, lng }) => {
+  // Position GPS : uniquement le transporteur assigné, mission "En route"
+  // (les changements de statut passent EXCLUSIVEMENT par l'API REST)
+  socket.on('positionUpdate', async ({ missionId, lat, lng } = {}) => {
     try {
-      const existing = await pool.query('SELECT statut FROM transport_missions WHERE id = $1', [
-        missionId,
-      ]);
-      if (!existing.rows[0]) return;
-
-      const nouveauStatut = existing.rows[0].statut === 'Acceptée' ? 'En route' : existing.rows[0].statut;
-
-      await pool.query(
-        `UPDATE transport_missions SET position_actuelle_lat = $1, position_actuelle_lng = $2, statut = $3, updated_at = now() WHERE id = $4`,
-        [lat, lng, nouveauStatut, missionId],
+      if (!UUID_RE.test(String(missionId))) return;
+      const la = Number(lat), lo = Number(lng);
+      if (!Number.isFinite(la) || !Number.isFinite(lo) || Math.abs(la) > 90 || Math.abs(lo) > 180) return;
+      const upd = await pool.query(
+        `UPDATE transport_missions
+            SET position_actuelle_lat = $1, position_actuelle_lng = $2, updated_at = now()
+          WHERE id = $3 AND transporteur_id = $4 AND statut = 'En route'
+        RETURNING statut`,
+        [la, lo, missionId, socket.user.id],
       );
-
+      if (upd.rowCount === 0) return;
       io.to(`mission:${missionId}`).emit('positionUpdated', {
         missionId,
-        lat,
-        lng,
-        statut: nouveauStatut,
+        lat: la,
+        lng: lo,
+        statut: upd.rows[0].statut,
         timestamp: new Date().toISOString(),
       });
     } catch (err) {
       console.error('[Socket.io] Erreur positionUpdate :', err.message);
-    }
-  });
-
-  socket.on('missionArrived', async (missionId) => {
-    await pool.query(
-      `UPDATE transport_missions SET statut = 'Arrivée', updated_at = now() WHERE id = $1`,
-      [missionId],
-    );
-    io.to(`mission:${missionId}`).emit('statusChanged', { missionId, statut: 'Arrivée' });
-  });
-
-  socket.on('missionDelivered', async ({ missionId, note }) => {
-    const result = await pool.query(
-      `UPDATE transport_missions SET statut = 'Livrée', note_transporteur = COALESCE($1, note_transporteur), updated_at = now() WHERE id = $2 RETURNING acheteur_id`,
-      [note || null, missionId],
-    );
-    io.to(`mission:${missionId}`).emit('statusChanged', { missionId, statut: 'Livrée' });
-
-    if (result.rows[0]) {
-      await notifyUser(
-        result.rows[0].acheteur_id,
-        'livraison_arrivee',
-        {},
-        { missionId },
-      );
     }
   });
 
