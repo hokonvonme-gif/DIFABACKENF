@@ -1271,10 +1271,25 @@ const API_MESSAGES = {
  },
  "L'assistant est temporairement indisponible. Réessayez plus tard.": {
   "en": "The assistant is temporarily unavailable. Please try again later.",
+  "ee": "Kpeɖeŋutɔ la mele asi fifia o. Gbugbɔ te kpɔ ake.",
+  "ha": "Mataimakin ba ya samuwa a yanzu. Sake gwadawa.",
   "es": "El asistente no está disponible temporalmente. Inténtelo más tarde.",
   "pt": "O assistente está temporariamente indisponível. Tente mais tarde.",
   "ar": "المساعد غير متاح مؤقتاً. حاول لاحقاً.",
-  "zh": "助手暂时不可用，请稍后再试。"
+  "zh": "助手暂时不可用，请稍后再试。",
+  "yo": "Olùrànlọ́wọ́ kò sí nísinsin yìí. Gbìyànjú lẹ́ẹ̀kan sí i.",
+  "kbp": "Sɔdʋ ɛɛwɛ fɛyɩ. Tɩkpa."
+ },
+ "L'assistant est temporairement indisponible. Réessayez dans quelques minutes.": {
+  "en": "The assistant is temporarily unavailable. Please try again in a few minutes.",
+  "ee": "Kpeɖeŋutɔ la mele asi fifia o. Gbugbɔ te kpɔ le miniti aɖewo megbe.",
+  "ha": "Mataimakin ba ya samuwa a yanzu. Sake gwadawa bayan ƴan mintuna.",
+  "es": "El asistente no está disponible temporalmente. Inténtelo de nuevo en unos minutos.",
+  "pt": "O assistente está temporariamente indisponível. Tente novamente dentro de alguns minutos.",
+  "ar": "المساعد غير متاح مؤقتاً. أعد المحاولة بعد بضع دقائق.",
+  "zh": "助手暂时不可用，请几分钟后再试。",
+  "yo": "Olùrànlọ́wọ́ kò sí nísinsin yìí. Gbìyànjú lẹ́ẹ̀kan sí i ní ìṣẹ́jú díẹ̀.",
+  "kbp": "Sɔdʋ ɛɛwɛ fɛyɩ. Tɩkpa nɛ miniti naa ŋga."
  },
  "Ajouté aux favoris.": {
   "en": "Added to favorites.",
@@ -4125,6 +4140,8 @@ async function callGeminiWithRotation(contents) {
     throw err;
   }
 
+  // Un seul modèle : GEMINI_MODEL (défaut gemini-flash-latest)
+  const model = GEMINI_MODEL;
   let lastError = null;
   const attempts = GEMINI_API_KEYS.length;
 
@@ -4132,39 +4149,33 @@ async function callGeminiWithRotation(contents) {
     const apiKey = GEMINI_API_KEYS[geminiKeyIndex];
     geminiKeyIndex = (geminiKeyIndex + 1) % GEMINI_API_KEYS.length;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
     try {
       const response = await axios.post(
         url,
         {
           contents,
-          generationConfig: { temperature: 0.6, maxOutputTokens: 800 },
+          generationConfig: { temperature: 0.6, maxOutputTokens: 1024 },
         },
-        { timeout: 25000 },
+        { timeout: 60000 }, // 60 s — cold start + génération
       );
 
       const replyText =
         response.data?.candidates?.[0]?.content?.parts?.[0]?.text ||
         "Désolé, je n'ai pas pu générer de réponse.";
 
-      console.log(`[Gemini] OK avec clé #${attempt + 1}/${attempts}`);
+      console.log(`[Gemini] OK modèle=${model} clé #${attempt + 1}/${attempts}`);
       return replyText;
     } catch (err) {
       lastError = err;
       const status = err.response?.status;
-      const msg = err.response?.data || err.message;
-      console.error(`[Gemini] échec clé #${attempt + 1}/${attempts} (HTTP ${status || 'réseau'}) :`, msg);
-
-      // Quota / auth / rate-limit → essayer la clé suivante
-      if (status === 429 || status === 403 || status === 401 || status === 400) {
-        continue;
-      }
-      // Timeout / réseau → essayer aussi la clé suivante
-      if (!status || err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
-        continue;
-      }
-      // Autre erreur HTTP : on continue quand même pour maximiser les chances
+      const detail = err.response?.data?.error?.message || err.response?.data || err.message;
+      console.error(
+        `[Gemini] échec modèle=${model} clé #${attempt + 1}/${attempts} (HTTP ${status || 'réseau'}) :`,
+        typeof detail === 'string' ? detail : JSON.stringify(detail),
+      );
+      // Quota / auth / rate-limit / réseau → essayer la clé suivante
       continue;
     }
   }
