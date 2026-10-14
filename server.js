@@ -898,6 +898,28 @@ const API_MESSAGES = {
   "ar": "إذا كان هذا الرقم مسجلاً فقد تم إرسال رمز.",
   "zh": "如果该号码已注册，验证码已发送。"
  },
+ "Produit retiré du marché (des commandes y sont liées).": {
+  "en": "Product removed from the market (linked orders exist).",
+  "ee": "Nusi la wotutu le asi me (aɖaŋudɔwo li).",
+  "ha": "An cire kaya daga kasuwa (akwai oda da ke danganta).",
+  "es": "Producto retirado del mercado (hay pedidos vinculados).",
+  "pt": "Produto retirado do mercado (existem encomendas ligadas).",
+  "ar": "تم سحب المنتج من السوق (طلبات مرتبطة).",
+  "zh": "商品已从市场下架（存在关联订单）。",
+  "yo": "A ti yọ ọja kúrò ní ọjà (àwọn àṣẹ wà).",
+  "kbp": "Nusi ɖɔ le asime (caŋ wɛ)."
+ },
+ "Produit retiré du marché (lié à d'autres données).": {
+  "en": "Product removed from the market (linked to other data).",
+  "ee": "Nusi la wotutu le asi me.",
+  "ha": "An cire kaya daga kasuwa.",
+  "es": "Producto retirado del mercado.",
+  "pt": "Produto retirado do mercado.",
+  "ar": "تم سحب المنتج من السوق.",
+  "zh": "商品已从市场下架。",
+  "yo": "A ti yọ ọja kúrò ní ọjà.",
+  "kbp": "Nusi ɖɔ le asime."
+ },
  "Produit introuvable.": {
   "en": "Product not found.",
   "es": "Producto no encontrado.",
@@ -2194,7 +2216,7 @@ router.get(
     const offset = (page - 1) * limit;
 
     // Visible dès la publication (validation admin optionnelle ensuite via badge / modération)
-    const conditions = [`statut IN ('Publié', 'En attente de validation')`];
+    const conditions = [`statut IN ('Publié', 'En attente de validation')`]; // 'Supprimé' exclu
     const values = [];
 
     if (q) {
@@ -2367,14 +2389,53 @@ router.delete(
   requireAuth,
   requireRole('agriculteur'),
   asyncHandler(async (req, res) => {
-    const existing = await pool.query('SELECT agriculteur_id FROM products WHERE id = $1', [
+    const existing = await pool.query('SELECT agriculteur_id, statut FROM products WHERE id = $1', [
       req.params.id,
     ]);
     if (!existing.rows[0]) return res.status(404).json({ message: 'Produit introuvable.' });
     if (existing.rows[0].agriculteur_id !== req.user.id) {
       return res.status(403).json({ message: 'Ce produit ne vous appartient pas.' });
     }
-    await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
+
+    // Des commandes référencent ce produit ? → soft-delete (conserver l'historique)
+    const orders = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM orders WHERE product_id = $1',
+      [req.params.id],
+    );
+    const orderCount = orders.rows[0]?.n || 0;
+
+    if (orderCount > 0) {
+      await pool.query(
+        `UPDATE products SET statut = 'Supprimé', updated_at = now() WHERE id = $1`,
+        [req.params.id],
+      );
+      // Retirer des favoris (optionnel, propre)
+      try {
+        await pool.query('DELETE FROM favorites WHERE product_id = $1', [req.params.id]);
+      } catch (_) {}
+      return res.status(200).json({
+        softDeleted: true,
+        message: 'Produit retiré du marché (des commandes y sont liées).',
+      });
+    }
+
+    // Pas de commande → suppression réelle (certifications/favoris en CASCADE)
+    try {
+      await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
+    } catch (e) {
+      // Dernier recours si une autre FK bloque encore
+      if (e.code === '23503') {
+        await pool.query(
+          `UPDATE products SET statut = 'Supprimé', updated_at = now() WHERE id = $1`,
+          [req.params.id],
+        );
+        return res.status(200).json({
+          softDeleted: true,
+          message: 'Produit retiré du marché (lié à d\'autres données).',
+        });
+      }
+      throw e;
+    }
     res.status(204).send();
   }),
 );
