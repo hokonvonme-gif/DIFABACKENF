@@ -522,6 +522,14 @@ async function initDatabase() {
       ))`);
   } catch (e) { console.warn('[DB] statut mission:', e.message); }
 
+  try {
+    await pool.query(`ALTER TABLE products DROP CONSTRAINT IF EXISTS products_statut_check`);
+    await pool.query(`ALTER TABLE products ADD CONSTRAINT products_statut_check
+      CHECK (statut IN (
+        'En attente de validation','Publié','Rejeté','Épuisé','Réservé','Supprimé'
+      ))`);
+  } catch (e) { console.warn('[DB] statut products:', e.message); }
+
   // Enrichir transactions
   await pool.query(`
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS operateur TEXT;
@@ -898,7 +906,7 @@ const API_MESSAGES = {
   "ar": "إذا كان هذا الرقم مسجلاً فقد تم إرسال رمز.",
   "zh": "如果该号码已注册，验证码已发送。"
  },
- "Produit retiré du marché (des commandes y sont liées).": {
+ "Produit retiré du marché (plus disponible à la vente).": {
   "en": "Product removed from the market (linked orders exist).",
   "ee": "Nusi la wotutu le asi me (aɖaŋudɔwo li).",
   "ha": "An cire kaya daga kasuwa (akwai oda da ke danganta).",
@@ -909,7 +917,7 @@ const API_MESSAGES = {
   "yo": "A ti yọ ọja kúrò ní ọjà (àwọn àṣẹ wà).",
   "kbp": "Nusi ɖɔ le asime (caŋ wɛ)."
  },
- "Produit retiré du marché (lié à d'autres données).": {
+ "Produit retiré du marché (plus disponible à la vente).": {
   "en": "Product removed from the market (linked to other data).",
   "ee": "Nusi la wotutu le asi me.",
   "ha": "An cire kaya daga kasuwa.",
@@ -2216,7 +2224,7 @@ router.get(
     const offset = (page - 1) * limit;
 
     // Visible dès la publication (validation admin optionnelle ensuite via badge / modération)
-    const conditions = [`statut IN ('Publié', 'En attente de validation')`]; // 'Supprimé' exclu
+    const conditions = [`statut IN ('Publié', 'En attente de validation')`]; // Épuisé / Supprimé exclus
     const values = [];
 
     if (q) {
@@ -2406,7 +2414,7 @@ router.delete(
 
     if (orderCount > 0) {
       await pool.query(
-        `UPDATE products SET statut = 'Supprimé', updated_at = now() WHERE id = $1`,
+        `UPDATE products SET statut = 'Épuisé', updated_at = now() WHERE id = $1`,
         [req.params.id],
       );
       // Retirer des favoris (optionnel, propre)
@@ -2415,7 +2423,7 @@ router.delete(
       } catch (_) {}
       return res.status(200).json({
         softDeleted: true,
-        message: 'Produit retiré du marché (des commandes y sont liées).',
+        message: 'Produit retiré du marché (plus disponible à la vente).',
       });
     }
 
@@ -2426,12 +2434,12 @@ router.delete(
       // Dernier recours si une autre FK bloque encore
       if (e.code === '23503') {
         await pool.query(
-          `UPDATE products SET statut = 'Supprimé', updated_at = now() WHERE id = $1`,
+          `UPDATE products SET statut = 'Épuisé', updated_at = now() WHERE id = $1`,
           [req.params.id],
         );
         return res.status(200).json({
           softDeleted: true,
-          message: 'Produit retiré du marché (lié à d\'autres données).',
+          message: 'Produit retiré du marché (plus disponible à la vente).',
         });
       }
       throw e;
