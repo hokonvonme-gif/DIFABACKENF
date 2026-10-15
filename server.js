@@ -530,6 +530,22 @@ async function initDatabase() {
       ))`);
   } catch (e) { console.warn('[DB] statut products:', e.message); }
 
+  // Produits orphelins (vendeur inexistant) ou compte désactivé → hors marché
+  try {
+    const r1 = await pool.query(
+      `UPDATE products SET statut = 'Épuisé', updated_at = now()
+       WHERE statut IN ('Publié', 'En attente de validation', 'Réservé')
+         AND (
+           agriculteur_id IS NULL
+           OR agriculteur_id NOT IN (SELECT id FROM users)
+           OR agriculteur_id IN (SELECT id FROM users WHERE is_active = false)
+         )`
+    );
+    if (r1.rowCount > 0) {
+      console.log(`[DB] ${r1.rowCount} produit(s) retirés du marché (vendeur absent ou inactif).`);
+    }
+  } catch (e) { console.warn('[DB] cleanup produits orphelins:', e.message); }
+
   // Enrichir transactions
   await pool.query(`
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS operateur TEXT;
@@ -2255,11 +2271,15 @@ router.get(
     if (sortBy === 'prix_asc') orderBy = 'prix_fcfa ASC';
     if (sortBy === 'prix_desc') orderBy = 'prix_fcfa DESC';
 
-    const countSql = `SELECT COUNT(*) FROM products WHERE ${conditions.join(' AND ')}`;
+    // Uniquement vendeurs encore actifs (compte non supprimé / non désactivé)
+    const sellerFilter = `agriculteur_id IN (SELECT id FROM users WHERE is_active = true)`;
+    const whereSql = `${conditions.join(' AND ')} AND ${sellerFilter}`;
+
+    const countSql = `SELECT COUNT(*) FROM products WHERE ${whereSql}`;
     const total = Number((await pool.query(countSql, values)).rows[0].count);
 
     values.push(limit, offset);
-    const sql = `SELECT * FROM products WHERE ${conditions.join(' AND ')} ORDER BY ${orderBy} LIMIT $${values.length - 1} OFFSET $${values.length}`;
+    const sql = `SELECT * FROM products WHERE ${whereSql} ORDER BY ${orderBy} LIMIT $${values.length - 1} OFFSET $${values.length}`;
     const result = await pool.query(sql, values);
 
     res.json({
@@ -5696,8 +5716,15 @@ router.patch(
   requireAuth,
   requireRole('admin'),
   asyncHandler(async (req, res) => {
-    await pool.query('UPDATE users SET is_active = false WHERE id = $1', [req.params.id]);
-    res.json({ message: 'Compte désactivé.' });
+    const uid = req.params.id;
+    await pool.query('UPDATE users SET is_active = false, disponible = false, updated_at = now() WHERE id = $1', [uid]);
+    // Retirer toutes ses offres du marché (plus de vendeur actif)
+    await pool.query(
+      `UPDATE products SET statut = 'Épuisé', updated_at = now()
+       WHERE agriculteur_id = $1 AND statut IN ('Publié', 'En attente de validation', 'Réservé')`,
+      [uid],
+    );
+    res.json({ message: 'Compte désactivé. Ses produits ont été retirés du marché.' });
   }),
 );
 
@@ -5708,6 +5735,78 @@ router.patch(
   asyncHandler(async (req, res) => {
     await pool.query('UPDATE users SET is_active = true WHERE id = $1', [req.params.id]);
     res.json({ message: 'Compte réactivé.' });
+  }),
+);
+
+/**
+ * Suppression définitive d'un compte + tout ce qui lui appartient.
+ * Ordre choisi pour respecter les FK (commandes → produits → user).
+ */
+router.delete(
+  '/admin/users/:id',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const uid = req.params.id;
+    if (uid === req.user.id) {
+      return res.status(400).json({ message: 'Vous ne pouvez pas supprimer votre propre compte admin.' });
+    }
+    const u = await pool.query('SELECT id, role FROM users WHERE id = $1', [uid]);
+    if (!u.rows[0]) return res.status(404).json({ message: 'Utilisateur introuvable.' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Produits de cet agriculteur
+      const prods = await client.query('SELECT id FROM products WHERE agriculteur_id = $1', [uid]);
+      const productIds = prods.rows.map((r) => r.id);
+
+      if (productIds.length) {
+        // Missions liées à ces produits
+        await client.query(
+          `DELETE FROM transport_missions WHERE product_id = ANY($1::uuid[])`,
+          [productIds],
+        );
+        // Commandes sur ces produits (acheteur ou vendeur)
+        await client.query(
+          `DELETE FROM orders WHERE product_id = ANY($1::uuid[]) OR agriculteur_id = $2 OR acheteur_id = $2`,
+          [productIds, uid],
+        );
+        await client.query(`DELETE FROM favorites WHERE product_id = ANY($1::uuid[])`, [productIds]);
+        await client.query(`DELETE FROM certifications WHERE product_id = ANY($1::uuid[])`, [productIds]);
+        await client.query(`DELETE FROM products WHERE agriculteur_id = $1`, [uid]);
+      } else {
+        await client.query(
+          `DELETE FROM orders WHERE agriculteur_id = $1 OR acheteur_id = $1`,
+          [uid],
+        );
+      }
+
+      // Missions où il est transporteur / acheteur
+      await client.query(
+        `DELETE FROM transport_missions WHERE transporteur_id = $1 OR acheteur_id = $1`,
+        [uid],
+      );
+
+      // Cultures + reste (la plupart en ON DELETE CASCADE, on force quand même)
+      await client.query(`DELETE FROM cultures WHERE agriculteur_id = $1`, [uid]);
+      await client.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [uid]);
+      await client.query(`DELETE FROM favorites WHERE user_id = $1`, [uid]);
+      await client.query(`DELETE FROM wallet_transactions WHERE user_id = $1`, [uid]);
+      await client.query(`DELETE FROM wallets WHERE user_id = $1`, [uid]);
+      await client.query(`DELETE FROM notifications WHERE user_id = $1`, [uid]).catch(() => {});
+
+      await client.query(`DELETE FROM users WHERE id = $1`, [uid]);
+      await client.query('COMMIT');
+      res.json({ message: 'Compte et toutes les données associées supprimés.' });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error('[Admin] purge user failed:', e.message);
+      res.status(500).json({ message: 'Suppression impossible: ' + e.message });
+    } finally {
+      client.release();
+    }
   }),
 );
 
