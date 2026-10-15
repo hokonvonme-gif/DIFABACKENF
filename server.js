@@ -3209,29 +3209,78 @@ function haversineKm(lat1, lng1, lat2, lng2) {
 const ROUTING_URL = (process.env.ROUTING_URL || 'https://router.project-osrm.org').replace(/\/$/, '');
 const routeCache = new Map();
 
+function maneuverInstruction(step) {
+  const m = step?.maneuver || {};
+  const type = String(m.type || '');
+  const mod = String(m.modifier || '');
+  const road = (step?.name || '').trim();
+  const on = road ? ` sur ${road}` : '';
+  const map = {
+    'depart': `Départ${on}`,
+    'arrive': 'Vous êtes arrivé à destination',
+    'turn|left': `Tournez à gauche${on}`,
+    'turn|right': `Tournez à droite${on}`,
+    'turn|slight left': `Tournez légèrement à gauche${on}`,
+    'turn|slight right': `Tournez légèrement à droite${on}`,
+    'turn|sharp left': `Virage serré à gauche${on}`,
+    'turn|sharp right': `Virage serré à droite${on}`,
+    'turn|uturn': `Faites demi-tour${on}`,
+    'new name': road ? `Continuez sur ${road}` : 'Continuez tout droit',
+    'continue': road ? `Continuez sur ${road}` : 'Continuez tout droit',
+    'merge': `Rejoignez la voie${on}`,
+    'on ramp': `Prenez la bretelle${on}`,
+    'off ramp': `Prenez la sortie${on}`,
+    'fork|left': `À la fourche, prenez à gauche${on}`,
+    'fork|right': `À la fourche, prenez à droite${on}`,
+    'end of road|left': `En fin de route, tournez à gauche${on}`,
+    'end of road|right': `En fin de route, tournez à droite${on}`,
+    'roundabout': `Au rond-point, prenez la sortie${on}`,
+    'rotary': `Au rond-point, prenez la sortie${on}`,
+    'notification': road || 'Continuez',
+  };
+  return map[`${type}|${mod}`] || map[type] || (road ? `Continuez sur ${road}` : 'Continuez tout droit');
+}
+
 async function getRoadRoute(lat1, lng1, lat2, lng2) {
-  const key = [lat1, lng1, lat2, lng2].map((x) => Number(x).toFixed(3)).join(',');
+  const key = [lat1, lng1, lat2, lng2].map((x) => Number(x).toFixed(3)).join(',') + '|steps';
   const hit = routeCache.get(key);
   if (hit && Date.now() - hit.at < 6 * 3600 * 1000) return hit.value;
   try {
     const url = `${ROUTING_URL}/route/v1/driving/${Number(lng1)},${Number(lat1)};${Number(lng2)},${Number(lat2)}` +
-      '?overview=full&geometries=geojson&alternatives=false&steps=false';
+      '?overview=full&geometries=geojson&alternatives=false&steps=true&annotations=false';
     const r = await axios.get(url, {
-      timeout: 8000,
+      timeout: 10000,
       headers: { 'User-Agent': 'DifaBackend/1.0 (logistique agricole, Togo)' },
     });
     const rt = r.data?.routes?.[0];
     if (r.data?.code === 'Ok' && rt?.geometry?.coordinates?.length) {
       let pts = rt.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-      if (pts.length > 400) {
-        const step = Math.ceil(pts.length / 400);
+      if (pts.length > 600) {
+        const step = Math.ceil(pts.length / 600);
         pts = pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+      }
+      const steps = [];
+      for (const leg of (rt.legs || [])) {
+        for (const s of (leg.steps || [])) {
+          const loc = s.maneuver?.location;
+          steps.push({
+            instruction: maneuverInstruction(s),
+            distanceM: Math.round(s.distance || 0),
+            durationS: Math.round(s.duration || 0),
+            type: s.maneuver?.type || '',
+            modifier: s.maneuver?.modifier || '',
+            name: s.name || '',
+            lat: loc ? Number(loc[1]) : null,
+            lng: loc ? Number(loc[0]) : null,
+          });
+        }
       }
       const value = {
         source: 'road',
         distanceKm: Math.round((rt.distance / 1000) * 10) / 10,
         durationMin: Math.max(1, Math.round(rt.duration / 60)),
         points: pts,
+        steps,
       };
       if (routeCache.size > 500) routeCache.delete(routeCache.keys().next().value);
       routeCache.set(key, { at: Date.now(), value });
@@ -3240,7 +3289,6 @@ async function getRoadRoute(lat1, lng1, lat2, lng2) {
   } catch (e) {
     console.warn('[Route] Service de routage indisponible, estimation en ligne droite :', e.message);
   }
-  // Repli : ligne droite majorée (les routes sont rarement droites), non mise en cache
   const km = Math.round(haversineKm(Number(lat1), Number(lng1), Number(lat2), Number(lng2)) * 1.3 * 10) / 10;
   const speed = await getCommissionPct('transport_speed_kmh', 30);
   return {
@@ -3248,6 +3296,10 @@ async function getRoadRoute(lat1, lng1, lat2, lng2) {
     distanceKm: km,
     durationMin: Math.max(1, Math.round((km / speed) * 60)),
     points: [[Number(lat1), Number(lng1)], [Number(lat2), Number(lng2)]],
+    steps: [
+      { instruction: 'Départ', distanceM: 0, durationS: 0, type: 'depart', modifier: '', name: '', lat: Number(lat1), lng: Number(lng1) },
+      { instruction: 'Vous êtes arrivé à destination', distanceM: Math.round(km * 1000), durationS: Math.round((km / speed) * 3600), type: 'arrive', modifier: '', name: '', lat: Number(lat2), lng: Number(lng2) },
+    ],
   };
 }
 
