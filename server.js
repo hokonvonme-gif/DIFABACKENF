@@ -546,6 +546,12 @@ async function initDatabase() {
     }
   } catch (e) { console.warn('[DB] cleanup produits orphelins:', e.message); }
 
+  try {
+    await pool.query(`ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_methode_check`);
+    await pool.query(`ALTER TABLE transactions ADD CONSTRAINT transactions_methode_check
+      CHECK (methode IN ('mobile_money','carte','portefeuille_interne','especes','cash'))`);
+  } catch (e) { console.warn('[DB] transactions methode:', e.message); }
+
   // Enrichir transactions
   await pool.query(`
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS operateur TEXT;
@@ -4700,29 +4706,167 @@ router.post(
 );
 
 
-/** Liste des moyens de paiement supportés (UI multi-langue côté app) */
+/** Moyens de paiement par pays (modèle type Gozem : 1 app, config distante) */
+const PAYMENT_BY_COUNTRY = {
+  TG: {
+    currency: 'XOF',
+    cash: true,
+    wallet: true,
+    mobileMoney: [
+      { id: 'tmoney', name: 'T-Money' },
+      { id: 'flooz', name: 'Flooz' },
+      { id: 'wave', name: 'Wave' },
+      { id: 'moov_money', name: 'Moov Money' },
+    ],
+    cards: [
+      { id: 'paystack', name: 'Paystack (Visa / Mastercard)' },
+      { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
+    ],
+  },
+  BJ: {
+    currency: 'XOF',
+    cash: true,
+    wallet: true,
+    mobileMoney: [
+      { id: 'mtn_momo', name: 'MTN MoMo' },
+      { id: 'moov_money', name: 'Moov Money' },
+      { id: 'flooz', name: 'Flooz' },
+    ],
+    cards: [
+      { id: 'paystack', name: 'Paystack (Visa / Mastercard)' },
+      { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
+    ],
+  },
+  GH: {
+    currency: 'GHS',
+    cash: true,
+    wallet: true,
+    mobileMoney: [
+      { id: 'mtn_momo', name: 'MTN MoMo' },
+      { id: 'vodafone_cash', name: 'Vodafone Cash' },
+      { id: 'airtel_money', name: 'AirtelTigo Money' },
+    ],
+    cards: [
+      { id: 'paystack', name: 'Paystack (Visa / Mastercard)' },
+    ],
+  },
+  CI: {
+    currency: 'XOF',
+    cash: true,
+    wallet: true,
+    mobileMoney: [
+      { id: 'orange_money', name: 'Orange Money' },
+      { id: 'mtn_momo', name: 'MTN MoMo' },
+      { id: 'wave', name: 'Wave' },
+      { id: 'moov_money', name: 'Moov Money' },
+    ],
+    cards: [
+      { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
+      { id: 'paystack', name: 'Paystack (Visa / Mastercard)' },
+    ],
+  },
+  CM: {
+    currency: 'XAF',
+    cash: true,
+    wallet: true,
+    mobileMoney: [
+      { id: 'mtn_momo', name: 'MTN MoMo' },
+      { id: 'orange_money', name: 'Orange Money' },
+    ],
+    cards: [
+      { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
+    ],
+  },
+  SN: {
+    currency: 'XOF',
+    cash: true,
+    wallet: true,
+    mobileMoney: [
+      { id: 'orange_money', name: 'Orange Money' },
+      { id: 'wave', name: 'Wave' },
+    ],
+    cards: [
+      { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
+    ],
+  },
+};
+
 router.get(
   '/payments/providers',
   requireAuth,
-  asyncHandler(async (_req, res) => {
-    res.json({
+  asyncHandler(async (req, res) => {
+    let code = (req.query.country || '').toString().toUpperCase();
+    if (!code || !PAYMENT_BY_COUNTRY[code]) {
+      try {
+        const u = await pool.query('SELECT country FROM users WHERE id = $1', [req.user.id]);
+        code = (u.rows[0]?.country || DEFAULT_COUNTRY).toUpperCase();
+      } catch (_) {
+        code = DEFAULT_COUNTRY;
+      }
+    }
+    const cfg = PAYMENT_BY_COUNTRY[code] || PAYMENT_BY_COUNTRY[DEFAULT_COUNTRY] || {
+      currency: 'XOF',
+      cash: true,
+      wallet: true,
       mobileMoney: [
-        { id: 'tmoney', name: 'TMoney', countries: ['TG'] },
-        { id: 'flooz', name: 'Flooz', countries: ['TG', 'BJ'] },
-        { id: 'wave', name: 'Wave', countries: ['TG', 'SN', 'CI'] },
-        { id: 'mtn_momo', name: 'MTN MoMo', countries: ['GH', 'CI', 'CM', 'BJ'] },
-        { id: 'vodafone_cash', name: 'Vodafone Cash', countries: ['GH'] },
-        { id: 'airtel_money', name: 'Airtel Money', countries: ['NE', 'TD'] },
-        { id: 'orange_money', name: 'Orange Money', countries: ['CI', 'SN', 'ML', 'BF'] },
-        { id: 'moov_money', name: 'Moov Money', countries: ['TG', 'BJ', 'CI'] },
+        { id: 'tmoney', name: 'T-Money' },
+        { id: 'flooz', name: 'Flooz' },
+        { id: 'wave', name: 'Wave' },
       ],
       cards: [
         { id: 'paystack', name: 'Paystack (Visa / Mastercard)' },
         { id: 'flutterwave', name: 'Flutterwave (Visa / Mastercard)' },
-        { id: 'card_ecobank', name: 'Carte Ecobank (via Paystack/Flutterwave)' },
-        { id: 'card_orabank', name: 'Carte Orabank (via Paystack/Flutterwave)' },
       ],
-      note: 'Ecobank/Orabank passent par Paystack ou Flutterwave (pas d API banque directe).',
+    };
+    res.json({
+      country: code,
+      currency: cfg.currency,
+      cash: cfg.cash !== false,
+      wallet: cfg.wallet !== false,
+      mobileMoney: cfg.mobileMoney || [],
+      cards: cfg.cards || [],
+      note: 'Une seule app ; les moyens dépendent du pays du compte (config serveur).',
+    });
+  }),
+);
+
+/** Paiement en espèces à la livraison / au retrait — confirme la commande sans débit électronique */
+router.post(
+  '/payments/cash/confirm',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { orderId } = req.body;
+    if (!orderId) return res.status(400).json({ message: 'orderId requis.' });
+    const chk = await resolveOrderPayable(orderId, req.user.id);
+    if (chk.error) return res.status(chk.status).json({ message: chk.error });
+
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO transactions (id, user_id, order_id, montant_fcfa, methode, statut)
+       VALUES ($1,$2,$3,$4,'especes','en_attente')`,
+      [id, req.user.id, orderId, chk.amount],
+    );
+    // Commande acceptée : paiement prévu en espèces (statut payé métier = engagé)
+    await pool.query(
+      `UPDATE orders SET statut = 'paye', updated_at = now() WHERE id = $1 AND statut = 'en_attente_paiement'`,
+      [orderId],
+    );
+    await pool.query(`UPDATE transactions SET statut = 'reussi' WHERE id = $1`, [id]);
+
+    try {
+      const o = await pool.query('SELECT agriculteur_id FROM orders WHERE id = $1', [orderId]);
+      if (o.rows[0]?.agriculteur_id) {
+        await notifyUser(o.rows[0].agriculteur_id, 'paiement_recu', {
+          amount: String(chk.amount),
+          method: 'cash',
+        }, { orderId });
+      }
+    } catch (_) {}
+
+    res.json({
+      message: 'Commande confirmée — paiement en espèces à la livraison.',
+      method: 'cash',
+      statut: 'paye',
     });
   }),
 );
