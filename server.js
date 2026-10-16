@@ -5018,12 +5018,185 @@ router.post(
   }),
 );
 
-/** Retrait portefeuille → Mobile Money / banque (sandbox ou API réelle) */
+/** Codes banque / opérateur pour transferts Flutterwave (Afrique de l'Ouest) */
+function flwBankCode(provider) {
+  const p = String(provider || '').toLowerCase();
+  const map = {
+    mtn_momo: 'MTN',
+    mtn: 'MTN',
+    vodafone_cash: 'VODAFONE',
+    vodafone: 'VODAFONE',
+    airtel_money: 'AIRTEL',
+    airtel: 'AIRTEL',
+    orange_money: 'ORANGE',
+    orange: 'ORANGE',
+    wave: 'WAVE',
+    flooz: 'FLOOZ',
+    tmoney: 'TMONEY',
+    t_money: 'TMONEY',
+    moov: 'MOOV',
+    bank: 'bank',
+  };
+  return map[p] || p.toUpperCase();
+}
+
+/**
+ * Exécute un vrai transfert sortant :
+ * 1) Flutterwave Transfer (idéal XOF / MoMo multi-pays)
+ * 2) sinon Paystack Transfer (si clé + recipient possibles)
+ * Retourne { ok, providerUsed, externalId, raw } ou { ok:false, error }
+ */
+async function executeRealPayout({ amount, provider, destination, accountName, reference, currency }) {
+  const cur = (currency || 'XOF').toUpperCase();
+  const dest = String(destination).replace(/\s+/g, '');
+  const name = (accountName || 'Beneficiaire Difa').slice(0, 80);
+  const flwKey = process.env.FLUTTERWAVE_SECRET_KEY;
+  const psKey = process.env.PAYSTACK_SECRET_KEY;
+
+  // --- Flutterwave Transfer ---
+  if (flwKey) {
+    try {
+      const bank = flwBankCode(provider);
+      const body = {
+        account_bank: bank === 'bank' ? (process.env.FLW_DEFAULT_BANK_CODE || '000') : bank,
+        account_number: dest,
+        amount: Number(amount),
+        narration: `Retrait Difa ${reference}`,
+        currency: cur,
+        reference: String(reference),
+        beneficiary_name: name,
+        debit_currency: cur,
+      };
+      const r = await axios.post('https://api.flutterwave.com/v3/transfers', body, {
+        timeout: 25000,
+        headers: {
+          Authorization: `Bearer ${flwKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const st = String(r.data?.status || '').toLowerCase();
+      if (st === 'success' || st === 'pending') {
+        return {
+          ok: true,
+          providerUsed: 'flutterwave',
+          externalId: String(r.data?.data?.id || r.data?.data?.reference || reference),
+          status: st,
+          raw: r.data,
+        };
+      }
+      return {
+        ok: false,
+        error: r.data?.message || 'Flutterwave a refusé le transfert',
+        raw: r.data,
+      };
+    } catch (e) {
+      const msg = e.response?.data?.message || e.message;
+      console.error('[Withdraw][Flutterwave]', msg);
+      // essaie Paystack en secours
+      if (!psKey) return { ok: false, error: msg };
+    }
+  }
+
+  // --- Paystack Transfer ---
+  if (psKey) {
+    try {
+      // 1) Créer le destinataire
+      const isBank = String(provider).toLowerCase() === 'bank';
+      const recipientBody = isBank
+        ? {
+            type: 'nuban',
+            name,
+            account_number: dest,
+            bank_code: process.env.PAYSTACK_DEFAULT_BANK_CODE || '057',
+            currency: cur === 'XOF' ? 'GHS' : cur, // Paystack: adapter selon compte marchand
+          }
+        : {
+            type: 'mobile_money',
+            name,
+            account_number: dest,
+            bank_code: flwBankCode(provider),
+            currency: cur === 'XOF' ? 'GHS' : cur,
+          };
+      const rec = await axios.post('https://api.paystack.co/transferrecipient', recipientBody, {
+        timeout: 20000,
+        headers: { Authorization: `Bearer ${psKey}`, 'Content-Type': 'application/json' },
+      });
+      const recipientCode = rec.data?.data?.recipient_code;
+      if (!recipientCode) {
+        return { ok: false, error: rec.data?.message || 'Destinataire Paystack invalide', raw: rec.data };
+      }
+      // Paystack amount = plus petite unité (x100)
+      const subunit = Math.round(Number(amount) * 100);
+      const tr = await axios.post(
+        'https://api.paystack.co/transfer',
+        {
+          source: 'balance',
+          amount: subunit,
+          recipient: recipientCode,
+          reason: `Retrait Difa ${reference}`,
+          reference: String(reference),
+        },
+        {
+          timeout: 25000,
+          headers: { Authorization: `Bearer ${psKey}`, 'Content-Type': 'application/json' },
+        },
+      );
+      if (tr.data?.status === true) {
+        return {
+          ok: true,
+          providerUsed: 'paystack',
+          externalId: String(tr.data?.data?.transfer_code || tr.data?.data?.id || reference),
+          status: tr.data?.data?.status || 'pending',
+          raw: tr.data,
+        };
+      }
+      return { ok: false, error: tr.data?.message || 'Paystack a refusé le transfert', raw: tr.data };
+    } catch (e) {
+      const msg = e.response?.data?.message || e.message;
+      console.error('[Withdraw][Paystack]', msg);
+      return { ok: false, error: msg };
+    }
+  }
+
+  return {
+    ok: false,
+    error:
+      'Aucun prestataire de transfert configuré. Définis FLUTTERWAVE_SECRET_KEY ou PAYSTACK_SECRET_KEY (live) sur le serveur.',
+  };
+}
+
+/** Rembourse le wallet si le transfert sortant échoue */
+async function refundFailedWithdraw(userId, amount, reference, reason) {
+  await withTransaction(async (c) => {
+    await c.query(
+      `UPDATE wallets SET solde_fcfa = solde_fcfa + $1, updated_at = now() WHERE user_id = $2`,
+      [amount, userId],
+    );
+    await c.query(
+      `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
+       VALUES ($1,$2,'credit',$3,$4,$5)`,
+      [
+        crypto.randomUUID(),
+        userId,
+        amount,
+        `Remboursement retrait échoué: ${String(reason || '').slice(0, 120)}`,
+        `${reference}-REFUND`,
+      ],
+    );
+    await c.query(
+      `UPDATE transactions SET statut = 'echec', metadata = COALESCE(metadata,'{}'::jsonb) || $2::jsonb
+       WHERE reference_externe = $1`,
+      [reference, JSON.stringify({ failReason: String(reason || '').slice(0, 200) })],
+    );
+  });
+}
+
+/** Retrait portefeuille → Mobile Money / banque (réel en prod, sandbox si MOBILE_MONEY_SANDBOX) */
 router.post(
   '/wallet/withdraw',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { montantFcfa, provider, destination, accountName } = req.body;
+    const { montantFcfa, provider, destination, accountName, currency } = req.body;
     const amount = Math.round(Number(montantFcfa) || 0);
     if (amount < 500) {
       return res.status(400).json({ message: 'Montant minimum de retrait : 500 FCFA.' });
@@ -5031,11 +5204,15 @@ router.post(
     if (!provider || !destination) {
       return res.status(400).json({ message: 'provider et destination (téléphone ou compte) requis.' });
     }
+    const destClean = String(destination).replace(/\s+/g, '');
+    if (destClean.length < 6) {
+      return res.status(400).json({ message: 'Numéro ou compte destinataire invalide.' });
+    }
     await ensureWallet(req.user.id);
     const id = crypto.randomUUID();
     const ref = `WD-${id.slice(0, 8)}`;
-    // Débit + historique + demande de retrait dans UNE transaction :
-    // soit tout réussit, soit rien (jamais d'argent débité sans trace).
+    const prov = String(provider).toLowerCase();
+
     const okDebit = await withTransaction(async (c) => {
       const debit = await c.query(
         `UPDATE wallets SET solde_fcfa = solde_fcfa - $1, updated_at = now()
@@ -5046,48 +5223,136 @@ router.post(
       await c.query(
         `INSERT INTO wallet_transactions (id, user_id, type, montant_fcfa, motif, reference_id)
          VALUES ($1,$2,'debit',$3,$4,$5)`,
-        [crypto.randomUUID(), req.user.id, amount, `Retrait ${provider}`, ref],
+        [crypto.randomUUID(), req.user.id, amount, `Retrait ${prov}`, ref],
       );
       await c.query(
         `INSERT INTO transactions (id, user_id, montant_fcfa, methode, statut, reference_externe, operateur, telephone_paiement, metadata)
          VALUES ($1,$2,$3,'mobile_money','en_attente',$4,$5,$6,$7)`,
         [
-          id, req.user.id, amount, ref, String(provider).toLowerCase(),
-          String(destination),
-          JSON.stringify({ type: 'withdraw', accountName: accountName || null, sandbox: SANDBOX_PAYMENTS }),
+          id,
+          req.user.id,
+          amount,
+          ref,
+          prov,
+          destClean,
+          JSON.stringify({
+            type: 'withdraw',
+            accountName: accountName || null,
+            sandbox: SANDBOX_PAYMENTS,
+            currency: currency || 'XOF',
+          }),
         ],
       );
       return true;
     });
     if (!okDebit) {
       const w = await pool.query('SELECT solde_fcfa FROM wallets WHERE user_id = $1', [req.user.id]);
-      return res.status(400).json({ message: 'Solde insuffisant.', soldeFcfa: Number(w.rows[0]?.solde_fcfa || 0) });
+      return res.status(400).json({
+        message: 'Solde insuffisant.',
+        soldeFcfa: Number(w.rows[0]?.solde_fcfa || 0),
+      });
     }
-    const sandbox = SANDBOX_PAYMENTS;
-    if (sandbox) {
+
+    // Sandbox tests uniquement
+    if (SANDBOX_PAYMENTS) {
       setTimeout(async () => {
         try {
           await pool.query(`UPDATE transactions SET statut = 'reussi' WHERE id = $1`, [id]);
           await notifyUser(req.user.id, 'retrait_reussi', { amount: String(amount) }, { reference: ref });
-          console.log(`[Withdraw][Sandbox] OK ${ref} ${amount} → ${provider} ${destination}`);
+          console.log(`[Withdraw][Sandbox] OK ${ref} ${amount} → ${prov} ${destClean}`);
         } catch (e) {
           console.error('[Withdraw] sandbox', e.message);
         }
       }, 1500);
-    } else {
-      // Production : brancher Paystack Transfer / Flutterwave Transfer / API opérateur
-      console.warn(`[Withdraw] Prod — exécuter transfert ${provider} ${destination} ${amount} FCFA (${ref})`);
+      return res.status(201).json({
+        message: 'Retrait initié (sandbox). Confirmation automatique sous peu.',
+        reference: ref,
+        transactionId: id,
+        montantFcfa: amount,
+        provider: prov,
+        destination: destClean,
+        sandbox: true,
+      });
     }
+
+    // Production réelle : Flutterwave / Paystack Transfer
+    const payout = await executeRealPayout({
+      amount,
+      provider: prov,
+      destination: destClean,
+      accountName,
+      reference: ref,
+      currency: currency || 'XOF',
+    });
+
+    if (!payout.ok) {
+      await refundFailedWithdraw(req.user.id, amount, ref, payout.error);
+      await notifyUser(
+        req.user.id,
+        'retrait_echec',
+        { amount: String(amount), reason: String(payout.error || '').slice(0, 80) },
+        { reference: ref },
+      );
+      return res.status(502).json({
+        message: 'Le transfert a échoué. Ton solde a été recrédité.',
+        error: payout.error,
+        reference: ref,
+        refunded: true,
+      });
+    }
+
+    await pool.query(
+      `UPDATE transactions SET statut = $1, metadata = COALESCE(metadata,'{}'::jsonb) || $2::jsonb
+       WHERE id = $3`,
+      [
+        payout.status === 'success' || payout.status === 'SUCCESS' ? 'reussi' : 'en_attente',
+        JSON.stringify({
+          payoutProvider: payout.providerUsed,
+          externalId: payout.externalId,
+          payoutStatus: payout.status,
+        }),
+        id,
+      ],
+    );
+
+    if (payout.status === 'success' || payout.status === 'SUCCESS') {
+      await notifyUser(req.user.id, 'retrait_reussi', { amount: String(amount) }, { reference: ref });
+    }
+
     res.status(201).json({
-      message: sandbox
-        ? 'Retrait initié (sandbox). Confirmation automatique sous peu.'
-        : 'Retrait en cours de traitement.',
+      message: 'Retrait envoyé vers ton compte. Traitement opérateur en cours.',
       reference: ref,
       transactionId: id,
       montantFcfa: amount,
-      provider,
-      destination,
-      sandbox,
+      provider: prov,
+      destination: destClean,
+      payoutProvider: payout.providerUsed,
+      externalId: payout.externalId,
+      sandbox: false,
+    });
+  }),
+);
+
+/** Statut d'un retrait par référence */
+router.get(
+  '/wallet/withdraw/:reference',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const r = await pool.query(
+      `SELECT id, statut, montant_fcfa, operateur, telephone_paiement, reference_externe, metadata, created_at
+       FROM transactions WHERE reference_externe = $1 AND user_id = $2`,
+      [req.params.reference, req.user.id],
+    );
+    if (!r.rows[0]) return res.status(404).json({ message: 'Retrait introuvable.' });
+    const row = r.rows[0];
+    res.json({
+      reference: row.reference_externe,
+      statut: row.statut,
+      montantFcfa: row.montant_fcfa,
+      provider: row.operateur,
+      destination: row.telephone_paiement,
+      metadata: row.metadata,
+      createdAt: row.created_at,
     });
   }),
 );
@@ -5420,6 +5685,10 @@ const NOTIF_I18N = {
     pt: { title: 'Transporte recusado', body: 'O comprador recusou o transporte. Missão cancelada.' },
     ar: { title: 'رفض النقل', body: 'رفض المشتري النقل. ألغيت المهمة.' },
     zh: { title: '拒绝运输', body: '买家拒绝运输。任务已取消。' },
+  },
+  retrait_echec: {
+    fr: 'Retrait de {{amount}} FCFA échoué. Solde recrédité.',
+    en: 'Withdrawal of {{amount}} FCFA failed. Balance refunded.',
   },
   retrait_reussi: {
     fr: { title: 'Retrait réussi', body: '{amount} FCFA envoyés vers votre compte.' },
